@@ -65,6 +65,7 @@ const quotes = [
   { text: "A jack of all trades is a master of none, but oftentimes better than a master of one.", author: "" },
   { text: "I just accept what's in front of me bru.", author: "eggchan" },
   { text: "I am the flame that refuses to be extinguished.", author: "FlameFrags" }
+  { text: "a to a? you mean tuah? heh, lonmg story....", author: "sanitypun01" }
 ];
 
 let quoteIndex = 0;

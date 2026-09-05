@@ -56,10 +56,10 @@ tabButtons.forEach(btn => {
 
 /* ===================== QUOTES ===================== */
 const quotes = [
-  { text: "Live, if only for the purpose of spiting death.", author: "alphahylian" },
+  { text: "Live, if only for the purpose of spiting death.", author: "AlphaHylian" },
   { text: "The clown who stumbles over his own feet is a gymnast and a juggler before he's a fool.", author: "Sean Anetsberger" },
   { text: "What's up with everyone and having friends?", author: "ShoeBilly_" },
-  { text: "I'm a failure, but I'm a failure that doesn't fail.", author: "betarito" },
+  { text: "I'm a failure, but I'm a failure that doesn't fail.", author: "BetaRito" },
   { text: "You have no concept of your potential. Don't burn hot, burn BRIGHT!", author: "Noah Bennet" },
   { text: "I remember it all. I am the one with infinite wisdom. I am the one who prophesizes. I am the dream catcher.", author: "eggchan" },
   { text: "A jack of all trades is a master of none, but oftentimes better than a master of one.", author: "" },
@@ -195,7 +195,7 @@ const HEAD_SPEED = 0.35;         // very responsive, just a touch of smoothing
 const BODY_ASSIST_SPEED = 0.1;   // how eagerly the body eases in past 40°
 const BODY_RESET_SPEED = 0.15;   // easing back to center after a drag
 const SETTLE_EPSILON = 0.015;
-const DRAG_SENSITIVITY = 0.008;
+const DRAG_SENSITIVITY = 0.016;
 const PITCH_DRAG_LIMIT = 1.2;
 
 let bodyYaw = 0, bodyPitch = 0;

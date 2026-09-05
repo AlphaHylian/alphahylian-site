@@ -2,8 +2,8 @@
 const bios = [
   "Professional Inaction Specialist",
   "Input-Based Voxel Simulation Manager",
-  "Pre-Revenue Ideation Specialist",
-  "Media Consumption Specialist"
+  "Pre-Revenue Ideation Director",
+  "Media Consumption President"
 ];
 let bioIndex = 0;
 const roleEl = document.getElementById('role-cycle');

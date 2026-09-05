@@ -64,7 +64,7 @@ const quotes = [
   { text: "I remember it all. I am the one with infinite wisdom. I am the one who prophesizes. I am the dream catcher.", author: "eggchan" },
   { text: "A jack of all trades is a master of none, but oftentimes better than a master of one.", author: "" },
   { text: "I just accept what's in front of me bru.", author: "eggchan" },
-  { text: "I am the flame that refuses to be extinguished.", author: "FlameFrags" }
+  { text: "I am the flame that refuses to be extinguished.", author: "FlameFrags" },
   { text: "a to a? you mean tuah? heh, lonmg story....", author: "sanitypun01" }
 ];
 

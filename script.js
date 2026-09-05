@@ -101,7 +101,7 @@ function prevQuote(){ setQuote((quoteIndex - 1 + quotes.length) % quotes.length,
 
 function restartQuoteTimer(){
   clearInterval(quoteTimer);
-  quoteTimer = setInterval(() => nextQuote(false), 6500);
+  quoteTimer = setInterval(() => nextQuote(false), 10000);
 }
 
 document.getElementById('quote-next').addEventListener('click', () => nextQuote(true));

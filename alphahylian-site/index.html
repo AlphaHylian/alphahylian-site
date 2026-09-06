@@ -45,7 +45,15 @@
     <button class="theme-option" role="menuitemradio" data-theme="paper" aria-checked="false" type="button">
       <span class="theme-swatch" data-sw="paper"></span><span>Paper &amp; Ink</span>
     </button>
+    <button class="theme-option" role="menuitemradio" data-theme="nether" aria-checked="false" type="button" id="theme-nether" hidden>
+      <span class="theme-swatch" data-sw="nether"></span><span>Nether</span>
+    </button>
   </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <span class="toast-icon" id="toast-icon">✦</span>
+  <span id="toast-text"></span>
 </div>
 
 <div class="app">
@@ -143,9 +151,44 @@
 
     <!-- PROJECTS -->
     <section class="tab-panel" id="panel-projects">
-      <div class="empty-state">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.2"/></svg>
-        <p>Nothing shipped yet. Check back later.</p>
+      <div class="projects">
+
+        <article class="proj proj-feature">
+          <div class="proj-art proj-art-site" aria-hidden="true">
+            <span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span>
+            <span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>
+          </div>
+          <div class="proj-body">
+            <span class="proj-tag">This site</span>
+            <h2 class="proj-title">alphahylian.com</h2>
+            <p class="proj-desc">Four hand-built themes (plus one you have to find), each with its own interactive canvas
+              background, quote effect and click effect, plus a 3D Minecraft skin that watches
+              your cursor and throws a punch when you click. Static files on Cloudflare &mdash;
+              no framework, no build step.</p>
+            <ul class="proj-tech">
+              <li>HTML/CSS/JS</li><li>skinview3d</li><li>Cloudflare</li>
+            </ul>
+            <div class="proj-links">
+              <a class="proj-link" href="https://github.com/AlphaHylian/alphahylian-site" target="_blank" rel="noopener">
+                Source on GitHub
+              </a>
+            </div>
+          </div>
+        </article>
+
+        <article class="proj proj-soon">
+          <div class="proj-body">
+            <h2 class="proj-title">More on the way</h2>
+            <p class="proj-desc">Whatever gets finished next lands here.
+              The Discord usually hears about it first.</p>
+            <div class="proj-links">
+              <a class="proj-link" href="https://discord.gg/QFWWQhbz7P" target="_blank" rel="noopener">
+                Join the Discord
+              </a>
+            </div>
+          </div>
+        </article>
+
       </div>
     </section>
 

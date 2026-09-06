@@ -68,7 +68,7 @@ tabButtons.forEach(btn => {
 });
 
 /* ===================== THEME SWITCHER ===================== */
-const THEMES = ['constellation', 'terminal', 'minecraft', 'paper'];
+const THEMES = ['constellation', 'terminal', 'minecraft', 'paper', 'nether'];
 // Older saved values that no longer exist map onto the default.
 const THEME_ALIASES = { stars: 'constellation', synthwave: 'constellation' };
 
@@ -452,6 +452,10 @@ QuoteEffects.paper = () => {
     }
   };
 };
+
+/* ---- nether: same trailing paint-mask as constellation, recoloured to fire
+       entirely in CSS (see html[data-theme="nether"] .quote-paint) ---- */
+QuoteEffects.nether = QuoteEffects.constellation;
 
 /* ===================== QUOTES ===================== */
 const quotes = [
@@ -1483,7 +1487,189 @@ Backgrounds.paper = () => makeBg(() => {
   return { init, resize: init, frame, click };
 });
 
+/* ---- nether: embers rising off a lava glow; clicking throws a fireball ---- */
+Backgrounds.nether = () => makeBg(() => {
+  const BURST_MS = 700;
+  let embers = [], bursts = [];
+
+  function makeEmber(atBottom){
+    return {
+      x: Math.random() * bgW,
+      y: atBottom ? bgH + Math.random() * 80 : Math.random() * bgH,
+      vy: -(16 + Math.random() * 52),          // px/s, rising
+      vx: (Math.random() - 0.5) * 16,
+      s: Math.random() < 0.75 ? 2 : 3,
+      phase: Math.random() * Math.PI * 2,
+      wob: 0.5 + Math.random() * 1.6,
+      soul: Math.random() < 0.1,               // rare soul-fire fleck
+      heat: 0
+    };
+  }
+
+  function init(){
+    const n = Math.min(210, Math.floor(bgW * bgH / 9000));
+    embers = Array.from({ length: n }, () => makeEmber(false));
+    bursts = [];
+  }
+
+  function click(x, y){
+    bursts.push({ x, y, t: performance.now() });
+    if(bursts.length > 4) bursts.shift();
+    for(let i = 0; i < 26; i++){
+      const e = makeEmber(false);
+      const a = Math.random() * Math.PI * 2;
+      const sp = 60 + Math.random() * 200;
+      e.x = x; e.y = y;
+      e.vx = Math.cos(a) * sp;
+      e.vy = Math.sin(a) * sp - 40;
+      e.heat = 1;
+      embers.push(e);
+    }
+    if(embers.length > 320) embers.splice(0, embers.length - 320);
+  }
+
+  function frame(dt, t){
+    const sec = dt / 1000;
+
+    const sky = bgCtx.createLinearGradient(0, 0, 0, bgH);
+    sky.addColorStop(0, '#140404');
+    sky.addColorStop(0.62, '#280907');
+    sky.addColorStop(1, '#4d1206');
+    bgCtx.fillStyle = sky;
+    bgCtx.fillRect(0, 0, bgW, bgH);
+
+    // lava glow pooling along the bottom edge
+    const glow = bgCtx.createLinearGradient(0, bgH * 0.72, 0, bgH);
+    glow.addColorStop(0, 'rgba(255,80,10,0)');
+    glow.addColorStop(1, 'rgba(255,120,26,0.34)');
+    bgCtx.fillStyle = glow;
+    bgCtx.fillRect(0, bgH * 0.72, bgW, bgH * 0.28);
+
+    for(let i = bursts.length - 1; i >= 0; i--){
+      if(t - bursts[i].t > BURST_MS) bursts.splice(i, 1);
+    }
+
+    for(let i = embers.length - 1; i >= 0; i--){
+      const e = embers[i];
+      e.phase += e.wob * sec * 2.4;
+      e.x += (e.vx + Math.sin(e.phase) * 16) * sec;
+      e.y += e.vy * sec;
+      e.vy += 22 * sec;              // buoyancy easing off as it cools
+
+      // the cursor is hot: nearby embers scatter and flare
+      const d = Math.hypot(e.x - mouse.x, e.y - mouse.y);
+      if(d < 150 && d > 0.001){
+        const f = (1 - d / 150);
+        e.x += ((e.x - mouse.x) / d) * f * 2.2;
+        e.y += ((e.y - mouse.y) / d) * f * 2.2;
+        e.heat = Math.max(e.heat, f);
+      }
+      e.heat *= 0.94;
+
+      if(e.y < -20 || e.x < -30 || e.x > bgW + 30){
+        embers[i] = makeEmber(true);
+        continue;
+      }
+
+      const depth = Math.min(1, e.y / bgH);           // hotter nearer the lava
+      const a = (0.28 + 0.52 * depth + e.heat * 0.5);
+      if(e.soul){
+        bgCtx.fillStyle = 'rgba(' + (90 + 90 * e.heat | 0) + ',' + (200 + 40 * e.heat | 0) + ',255,' + Math.min(1, a).toFixed(3) + ')';
+      } else {
+        const g = 90 + 110 * depth + 55 * e.heat;
+        bgCtx.fillStyle = 'rgba(255,' + (g | 0) + ',' + (30 + 60 * e.heat | 0) + ',' + Math.min(1, a).toFixed(3) + ')';
+      }
+      const size = e.s + (e.heat > 0.5 ? 1 : 0);
+      bgCtx.fillRect(e.x, e.y, size, size);
+    }
+
+    // fireball shockwaves
+    for(const b of bursts){
+      const age = Math.max(0, (t - b.t) / BURST_MS);
+      const r = Math.max(0, age * 260);
+      bgCtx.strokeStyle = 'rgba(255,' + (140 + 80 * (1 - age) | 0) + ',60,' + (0.5 * (1 - age)).toFixed(3) + ')';
+      bgCtx.lineWidth = 3 * (1 - age) + 0.5;
+      bgCtx.beginPath();
+      bgCtx.arc(b.x, b.y, r, 0, Math.PI * 2);
+      bgCtx.stroke();
+    }
+  }
+
+  return { init, resize: init, frame, click };
+});
+
+/* ===================== TOAST + EASTER EGGS ===================== */
+const toastEl = document.getElementById('toast');
+const toastText = document.getElementById('toast-text');
+const toastIcon = document.getElementById('toast-icon');
+let toastTimer = null;
+
+function showToast(html, icon, ms){
+  if(!toastEl) return;
+  toastText.innerHTML = html;
+  toastIcon.textContent = icon || '\u2726';
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), ms || 4600);
+}
+
+/* ---- Konami code unlocks the hidden Nether style ---- */
+const NETHER_KEY = 'ah-nether';
+const netherOption = document.getElementById('theme-nether');
+
+function netherUnlocked(){
+  try { return localStorage.getItem(NETHER_KEY) === '1'; } catch(e){ return false; }
+}
+function revealNether(){
+  if(netherOption) netherOption.hidden = false;
+}
+function unlockNether(){
+  const already = netherUnlocked();
+  try { localStorage.setItem(NETHER_KEY, '1'); } catch(e){}
+  revealNether();
+  applyTheme('nether');
+  closeThemeMenu();
+  showToast(already
+    ? '<b>Nether.</b> Welcome back to the other side.'
+    : '<b>Nether unlocked.</b> A fifth style just appeared in the theme menu.',
+    '\uD83D\uDD25', 5200);
+}
+
+const KONAMI = ['arrowup','arrowup','arrowdown','arrowdown','arrowleft','arrowright','arrowleft','arrowright','b','a'];
+let konamiPos = 0;
+document.addEventListener('keydown', e => {
+  const k = (e.key || '').toLowerCase();
+  if(k === KONAMI[konamiPos]){
+    konamiPos++;
+    if(konamiPos === KONAMI.length){ konamiPos = 0; unlockNether(); }
+  } else {
+    konamiPos = (k === KONAMI[0]) ? 1 : 0;
+  }
+});
+
+/* ---- seven quick taps on the avatar and he swings for it ---- */
+const avatarEl = document.querySelector('.avatar');
+if(avatarEl){
+  let taps = 0, tapTimer = null;
+  avatarEl.style.cursor = 'pointer';
+  avatarEl.addEventListener('click', () => {
+    taps++;
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => { taps = 0; }, 1400);
+    if(taps >= 7){
+      taps = 0;
+      showToast('<b>Alright, alright.</b> That is the secret handshake.', '\uD83E\uDD1C');
+      let n = 0;
+      const combo = setInterval(() => {
+        triggerPunch();
+        if(++n >= 5) clearInterval(combo);
+      }, 400);
+    }
+  });
+}
+
 /* ===================== INIT THEME ===================== */
 let savedTheme = 'constellation';
 try { savedTheme = localStorage.getItem('ah-theme') || 'constellation'; } catch(e){}
+if(netherUnlocked() || savedTheme === 'nether') revealNether();
 applyTheme(savedTheme);

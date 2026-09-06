@@ -81,6 +81,7 @@ const state = {
   ext: 'mp4',
   duration: 0,
   pcm: null,          // Float32Array, mono
+  waveGain: 1,        // display-only scale so quiet recordings still show up
   sampleRate: 0,
   frameDb: null,      // Float32Array of per-hop dBFS
   keep: [],           // [[start,end], ...] seconds
@@ -228,6 +229,18 @@ function keptDuration(keep) {
 }
 
 /* ------------------------------------------------------------ waveform */
+// Absolute level says nothing useful here — a quietly recorded take would draw
+// as a flat line. Scale the display so the loudest peak fills the panel.
+function waveGainFor(pcm) {
+  let peak = 0;
+  const step = Math.max(1, Math.floor(pcm.length / 200000));
+  for (let i = 0; i < pcm.length; i += step) {
+    const v = Math.abs(pcm[i]);
+    if (v > peak) peak = v;
+  }
+  return peak > 0.001 ? 1 / peak : 1;
+}
+
 function drawWave() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   const w = waveEl.clientWidth, h = waveEl.clientHeight;
@@ -263,7 +276,7 @@ function drawWave() {
     const end = Math.min(pcm.length, Math.floor((x + 1) * perPx));
     let peak = 0;
     for (let i = start; i < end; i++) { const v = Math.abs(pcm[i]); if (v > peak) peak = v; }
-    const amp = Math.max(1, peak * mid * 0.95);
+    const amp = Math.max(1, Math.min(mid, peak * state.waveGain * mid * 0.95));
     g.fillStyle = inKeep[x] ? accent : faint;
     g.globalAlpha = inKeep[x] ? 0.95 : 0.25;
     g.fillRect(x, mid - amp, 1, amp * 2);
@@ -355,6 +368,7 @@ async function handleFile(file) {
     state.sampleRate = audio.sampleRate;
     state.duration = audio.duration;
     state.frameDb = computeFrameDb(state.pcm, state.sampleRate);
+    state.waveGain = waveGainFor(state.pcm);
 
     await ffmpeg.deleteFile('probe.wav');
 

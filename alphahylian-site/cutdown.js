@@ -46,6 +46,10 @@ const MAX_SEGMENTS = 400;
 const MIN_CLIP = 0.12;     // seconds; drop keep-ranges shorter than this
 const HOP_SECONDS = 0.02;  // analysis window
 
+// Above this, the finished video is big enough that holding it in memory is a
+// real risk, so the save-to-disk option gets ticked for you.
+const DISK_SUGGEST_BYTES = 600 * 1024 * 1024;
+
 /* ------------------------------------------------------------------ DOM */
 const el = id => document.getElementById(id);
 const dropEl = el('cd-drop');
@@ -70,6 +74,9 @@ const autoEl = el('cd-auto');
 const autoNoteEl = el('cd-autonote');
 const previewEl = el('cd-preview');
 const engineEl = el('cd-engine');
+const diskRowEl = el('cd-diskrow');
+const diskHintEl = el('cd-diskhint');
+const diskEl = el('cd-todisk');
 
 const ctrl = {
   thr: el('cd-thr'), thrV: el('cd-thr-v'),
@@ -403,6 +410,7 @@ async function handleFile(file) {
   const dot = file.name.lastIndexOf('.');
   state.ext = dot > -1 ? file.name.slice(dot + 1).toLowerCase() : 'mp4';
   filenameEl.textContent = `${file.name} · ${fmtSize(file.size)}`;
+  offerDiskSave(file);
 
   videoEl.src = URL.createObjectURL(file);
   workEl.classList.add('on');
@@ -504,6 +512,21 @@ async function processWithFFmpeg(onProgress) {
 
 async function process() {
   if (state.busy || !state.file || !state.keep.length) return;
+
+  // The save dialog has to be the very first thing we await: it needs the
+  // activation from the click that got us here, and that doesn't survive a
+  // trip through the encoder setup.
+  let sink = null;
+  if (diskEl.checked && diskSaveAvailable()) {
+    try {
+      sink = await openDiskSink();
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;   // they closed the dialog
+      showError('Could not open that file for writing: ' + (err && err.message ? err.message : err));
+      return;
+    }
+  }
+
   state.busy = true;
   goEl.disabled = true;
   clearError();
@@ -518,7 +541,7 @@ async function process() {
   };
 
   const started = performance.now();
-  let blob = null, engine = '';
+  let blob = null, engine = '', savedTo = null;
 
   // The fast path needs an MP4/MOV the browser can decode; everything else
   // (MKV, WebM, exotic codecs) goes to ffmpeg.
@@ -528,14 +551,17 @@ async function process() {
     if (fastEligible) {
       try {
         engineEl.textContent = 'Using the browser’s own video encoder';
-        const r = await processFast(onProgress);
+        const r = await processFast(onProgress, sink);
         blob = r.blob;
+        savedTo = r.savedTo || null;
         engine = `browser encoder · ${r.stats.decoded} frames read, ${r.stats.encoded} kept`;
       } catch (err) {
         console.warn('[cutdown] fast path unavailable, falling back to ffmpeg:', err);
         engineEl.textContent = 'Browser encoder could not handle this file (' +
           (err && err.message ? err.message : err) + ') — using ffmpeg, which is slower.';
         blob = null;
+        // a half-written file is no use to ffmpeg; start it over
+        if (sink) await resetDiskSink(sink);
       }
     } else if (!webCodecsAvailable()) {
       engineEl.textContent = 'This browser has no video encoder API — using ffmpeg, which is slower.';
@@ -546,16 +572,26 @@ async function process() {
     if (!blob) {
       blob = await processWithFFmpeg(onProgress);
       engine = engine || 'ffmpeg.wasm';
+      // ffmpeg builds the whole file before handing it over, so the most we
+      // can do for the disk option here is put it where they asked.
+      if (sink) {
+        onProgress(0.99, 'Saving…');
+        await sink.stream.write(blob);
+        await sink.stream.close();
+        blob = await sink.handle.getFile();
+        savedTo = sink.handle.name;
+      }
     }
 
     if (state.outUrl) URL.revokeObjectURL(state.outUrl);
     state.outUrl = URL.createObjectURL(blob);
     outEl.src = state.outUrl;
     downloadEl.href = state.outUrl;
-    const base = state.file.name.replace(/\.[^.]+$/, '');
-    downloadEl.download = `${base} (cutdown).mp4`;
+    downloadEl.download = outputName();
+    downloadEl.hidden = !!savedTo;   // already on disk; a second copy helps nobody
     const secs = (performance.now() - started) / 1000;
     outinfoEl.textContent =
+      (savedTo ? `Saved as ${savedTo} · ` : '') +
       `${fmtTime(keptDuration(state.keep))} · ${fmtSize(blob.size)} · took ${fmtTime(secs)}`;
     engineEl.textContent = engine;
 
@@ -565,6 +601,7 @@ async function process() {
   } catch (err) {
     console.error(err);
     progEl.classList.remove('on');
+    if (sink) { try { await sink.stream.close(); } catch (_) { /* nothing to save */ } }
     showError('Encoding failed: ' + (err && err.message ? err.message : err) +
       ' — a shorter clip or Draft quality usually gets through.');
   } finally {
@@ -724,6 +761,47 @@ window.__cutdown = { findKeep, computeFrameDb, buildFilterGraph, state, HOP_SECO
    measured ones and audio-only ffmpeg is cheap.
    ===================================================================== */
 
+/* ------------------------------------------------------------ disk sink
+
+   The muxer will happily assemble the whole output in memory, which is fine
+   for a clip and hopeless for a two-hour recording. Where the browser has the
+   File System Access API we instead ask for the save location up front and
+   stream the muxed bytes into it, so peak memory stays flat no matter how long
+   the video is. Firefox and Safari don't have the API, and fall back to the
+   in-memory path.
+   ------------------------------------------------------------------------ */
+
+function diskSaveAvailable() {
+  return typeof window.showSaveFilePicker === 'function';
+}
+
+/** Show (and pre-tick, for big files) the save-to-disk option. */
+function offerDiskSave(file) {
+  if (!diskSaveAvailable()) return;
+  diskRowEl.hidden = false;
+  diskHintEl.hidden = false;
+  if (file.size >= DISK_SUGGEST_BYTES) diskEl.checked = true;
+}
+
+function outputName() {
+  return `${state.file.name.replace(/\.[^.]+$/, '')} (cutdown).mp4`;
+}
+
+/** Must be called straight out of the click — the picker needs that gesture. */
+async function openDiskSink() {
+  const handle = await window.showSaveFilePicker({
+    suggestedName: outputName(),
+    types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }]
+  });
+  return { handle, stream: await handle.createWritable() };
+}
+
+/** Reopen after a failed attempt; createWritable truncates, so this is clean. */
+async function resetDiskSink(sink) {
+  try { await sink.stream.close(); } catch (_) { /* already broken */ }
+  sink.stream = await sink.handle.createWritable();
+}
+
 // Bits per pixel per frame — resolution and frame rate then set the bitrate.
 const BPP = { draft: 0.06, normal: 0.10, high: 0.16 };
 
@@ -831,7 +909,7 @@ async function buildAudioTrack(keep, levelKey, wantLufs, inName) {
   return audio;
 }
 
-async function processFast(onProgress) {
+async function processFast(onProgress, sink) {
   const keep = state.keep;
   const offsets = cumulativeOffsets(keep);
   const inName = 'input.' + state.ext;
@@ -860,11 +938,18 @@ async function processFast(onProgress) {
   onProgress(0.05, 'Levelling the audio…');
   const audio = await buildAudioTrack(keep, state.level, ctrl.lufs.checked, inName);
 
+  // Streaming to disk means the moov box lands at the end of the file rather
+  // than the front; for a local file that costs nothing, and it is what lets
+  // the muxer let go of each sample as soon as it is written.
+  const target = sink
+    ? new window.Mp4Muxer.FileSystemWritableFileStreamTarget(sink.stream, { chunkSize: 8 * 1024 * 1024 })
+    : new window.Mp4Muxer.ArrayBufferTarget();
+
   const muxer = new window.Mp4Muxer.Muxer({
-    target: new window.Mp4Muxer.ArrayBufferTarget(),
+    target,
     video: { codec: 'avc', width, height },
     audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: Math.min(2, audio.numberOfChannels) },
-    fastStart: 'in-memory',
+    fastStart: sink ? false : 'in-memory',
     firstTimestampBehavior: 'offset'
   });
 
@@ -949,6 +1034,15 @@ async function processFast(onProgress) {
   aEnc.close();
 
   muxer.finalize();
+
+  if (sink) {
+    onProgress(0.99, 'Finishing the file…');
+    await sink.stream.close();
+    // getFile() hands back a disk-backed File, so playing it back afterwards
+    // doesn't pull the whole thing into memory again.
+    return { blob: await sink.handle.getFile(), savedTo: sink.handle.name, stats: { decoded, encoded, fps } };
+  }
+
   onProgress(1, 'Done');
   return {
     blob: new Blob([muxer.target.buffer], { type: 'video/mp4' }),

@@ -66,6 +66,9 @@ const outEl = el('cd-out');
 const downloadEl = el('cd-download');
 const outinfoEl = el('cd-outinfo');
 const errEl = el('cd-err');
+const autoEl = el('cd-auto');
+const autoNoteEl = el('cd-autonote');
+const previewEl = el('cd-preview');
 
 const ctrl = {
   thr: el('cd-thr'), thrV: el('cd-thr-v'),
@@ -88,6 +91,7 @@ const state = {
   level: 'even',
   quality: 'normal',
   busy: false,
+  preview: false,
   outUrl: null
 };
 
@@ -224,6 +228,31 @@ function findKeep(frameDb, threshold, minSilence, pad, duration) {
   return kept.length ? kept : [[0, duration]];
 }
 
+/**
+ * Guess sensible settings from the audio itself. The threshold is the one
+ * nobody can pick blind: it has to sit above whatever the room noise floor is
+ * but clearly below the level the speech sits at.
+ */
+function autoSettings(frameDb) {
+  const sorted = Float32Array.from(frameDb).sort();
+  const pct = p => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(p * (sorted.length - 1))))];
+  const floor = pct(0.10);    // room tone / digital silence
+  const speech = pct(0.85);   // where the talking actually sits
+
+  // above the floor, but never so close to speech that words get chopped
+  let thr = Math.max(floor + 8, speech - 22);
+  thr = Math.min(thr, speech - 8);
+  thr = Math.max(-60, Math.min(-20, thr));
+
+  return {
+    threshold: Math.round(thr),
+    minSilence: 0.35,
+    pad: 0.08,
+    floor: floor,
+    speech: speech
+  };
+}
+
 function keptDuration(keep) {
   return keep.reduce((a, r) => a + (r[1] - r[0]), 0);
 }
@@ -259,6 +288,24 @@ function drawWave() {
   g.fillRect(0, 0, w, h);
 
   if (!state.pcm || !state.duration) return;
+
+  // Shade every stretch that is going to be removed, and rule a line at each
+  // cut, so what survives is obvious at a glance rather than implied.
+  const border = themeColour('--border', '#27272c');
+  let prevEnd = 0;
+  const shadeCut = (from, to) => {
+    const x0 = (from / state.duration) * w, x1 = (to / state.duration) * w;
+    if (x1 - x0 < 0.5) return;
+    g.fillStyle = border;
+    g.globalAlpha = 0.5;
+    g.fillRect(x0, 0, x1 - x0, h);
+    g.globalAlpha = 1;
+    g.fillStyle = themeColour('--text-faint', '#6b6a72');
+    g.fillRect(x0, 0, 1, h);
+    g.fillRect(x1 - 1, 0, 1, h);
+  };
+  for (const [s0, e0] of state.keep) { shadeCut(prevEnd, s0); prevEnd = e0; }
+  shadeCut(prevEnd, state.duration);
   const pcm = state.pcm;
   const mid = h / 2;
   const perPx = pcm.length / w;
@@ -302,6 +349,27 @@ function renderStats() {
     `<span>After cuts <b>${fmtTime(kept)}</b></span>` +
     `<span class="good">Saved <b>${fmtTime(saved)}</b> (${pct}%)</span>` +
     `<span>Cuts <b>${cuts}</b></span>`;
+}
+
+// Push auto-picked values into the controls. Called once when a file lands and
+// again whenever the Auto button is pressed.
+function applyAuto(quiet) {
+  if (!state.frameDb) return;
+  const a = autoSettings(state.frameDb);
+  ctrl.thr.value = a.threshold;
+  ctrl.min.value = a.minSilence;
+  ctrl.pad.value = a.pad;
+  syncControlLabels();
+  if (!quiet) recompute();
+  autoNoteEl.textContent =
+    `Auto: noise floor ${Math.round(a.floor)} dB, speech ${Math.round(a.speech)} dB ` +
+    `→ threshold ${a.threshold} dB`;
+}
+
+function syncControlLabels() {
+  ctrl.thrV.textContent = `${ctrl.thr.value} dB`.replace('-', '−');
+  ctrl.minV.textContent = `${(+ctrl.min.value).toFixed(2)} s`;
+  ctrl.padV.textContent = `${(+ctrl.pad.value).toFixed(2)} s`;
 }
 
 function recompute() {
@@ -371,6 +439,8 @@ async function handleFile(file) {
     state.waveGain = waveGainFor(state.pcm);
 
     await ffmpeg.deleteFile('probe.wav');
+
+    applyAuto(true);
 
     barEl.style.width = '100%';
     progEl.classList.remove('on');
@@ -468,6 +538,42 @@ async function process() {
   }
 }
 
+/* ------------------------------------------------------------- preview */
+// Play the source but jump over everything that is going to be removed, so you
+// can hear the result before committing to an encode.
+function nextKeepAfter(t) {
+  for (const [s0] of state.keep) if (s0 > t + 0.01) return s0;
+  return null;
+}
+function inKeep(t) {
+  return state.keep.some(([s0, e0]) => t >= s0 - 0.01 && t <= e0 + 0.01);
+}
+
+function onPreviewTick() {
+  if (!state.preview || !state.keep.length || videoEl.paused) return;
+  const t = videoEl.currentTime;
+  if (inKeep(t)) return;
+  const next = nextKeepAfter(t);
+  if (next == null) { videoEl.pause(); videoEl.currentTime = state.keep[0][0]; }
+  else videoEl.currentTime = next;
+}
+
+function setPreview(on) {
+  state.preview = on;
+  previewEl.setAttribute('aria-pressed', String(on));
+  previewEl.textContent = on ? 'Previewing cuts' : 'Preview cuts';
+  if (on) {
+    // jump forward to the next surviving section rather than back to the top
+    if (!inKeep(videoEl.currentTime)) {
+      const next = nextKeepAfter(videoEl.currentTime);
+      videoEl.currentTime = next != null ? next : (state.keep.length ? state.keep[0][0] : 0);
+    }
+    videoEl.play().catch(() => {});
+  } else {
+    videoEl.pause();
+  }
+}
+
 /* --------------------------------------------------- captions hook ----
    A future subtitles pass slots in here: run Whisper over the *cut* audio
    (silence already removed, so its timestamps line up with output.mp4),
@@ -486,13 +592,13 @@ dropEl.addEventListener('drop', e => {
 });
 fileEl.addEventListener('change', () => handleFile(fileEl.files && fileEl.files[0]));
 
-[['thr', v => `${v} dB`], ['min', v => `${(+v).toFixed(2)} s`], ['pad', v => `${(+v).toFixed(2)} s`]]
-  .forEach(([key, fmt]) => {
-    ctrl[key].addEventListener('input', () => {
-      ctrl[key + 'V'].textContent = fmt(ctrl[key].value).replace('-', '−');
-      recompute();
-    });
+['thr', 'min', 'pad'].forEach(key => {
+  ctrl[key].addEventListener('input', () => {
+    syncControlLabels();
+    autoNoteEl.textContent = '';
+    recompute();
   });
+});
 
 function wireSegmented(group, onPick) {
   group.addEventListener('click', e => {
@@ -523,7 +629,11 @@ resetEl.addEventListener('click', () => {
   clearError();
 });
 
-videoEl.addEventListener('timeupdate', drawWave);
+autoEl.addEventListener('click', () => applyAuto(false));
+previewEl.addEventListener('click', () => setPreview(!state.preview));
+videoEl.addEventListener('pause', () => { if (state.preview) setPreview(false); });
+
+videoEl.addEventListener('timeupdate', () => { onPreviewTick(); drawWave(); });
 waveEl.addEventListener('click', e => {
   if (!state.duration) return;
   const r = waveEl.getBoundingClientRect();

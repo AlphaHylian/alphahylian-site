@@ -113,6 +113,25 @@
   .cd-check{ display:flex; align-items:center; gap:9px; font-size:12.5px; color:var(--text-dim); cursor:pointer; }
   .cd-check input{ accent-color:var(--accent); width:15px; height:15px; }
 
+  .cd-auto{
+    width:100%; padding:10px 14px; border-radius:calc(var(--panel-radius) - 4px);
+    border:1px solid var(--accent); background:var(--accent-deep); color:var(--text);
+    font-family:var(--font-body); font-size:13px; font-weight:600; cursor:pointer;
+  }
+  html[data-theme=paper] .cd-auto{ color:#fff; }
+  .cd-auto:hover{ filter:brightness(1.12); }
+  #cd-preview[aria-pressed=true]{ border-color:var(--accent); color:var(--text); background:var(--accent-deep); }
+  html[data-theme=paper] #cd-preview[aria-pressed=true]{ color:#fff; }
+
+  .cd-legend{
+    display:flex; gap:16px; align-items:center; flex-wrap:wrap;
+    margin-top:10px; font-size:12px; color:var(--text-faint);
+  }
+  .cd-legend i{ font-style:normal; display:inline-flex; align-items:center; gap:6px; }
+  .cd-legend .sw{ width:14px; height:10px; border-radius:2px; display:inline-block; }
+  .cd-legend .sw.keep{ background:var(--accent); }
+  .cd-legend .sw.cut{ background:repeating-linear-gradient(45deg,var(--border) 0 3px,transparent 3px 6px); border:1px solid var(--border); }
+
   /* ---- waveform ---- */
   .cd-wavewrap{ padding:14px 16px 16px; }
   #cd-wave{ width:100%; height:120px; display:block; cursor:pointer; border-radius:6px; }
@@ -197,6 +216,11 @@
 
       <div class="cd-card cd-controls">
         <div class="cd-group">
+          <button type="button" class="cd-auto" id="cd-auto">Auto-detect settings</button>
+          <div class="cd-hint" id="cd-autonote"></div>
+        </div>
+
+        <div class="cd-group">
           <label>Silence threshold <span class="cd-val" id="cd-thr-v">−45 dB</span></label>
           <input type="range" id="cd-thr" min="-60" max="-20" step="1" value="-45">
           <div class="cd-hint">Anything quieter than this counts as silence. Raise it if quiet talking is being cut.</div>
@@ -239,11 +263,17 @@
 
     <div class="cd-card cd-wavewrap">
       <canvas id="cd-wave"></canvas>
+      <div class="cd-legend">
+        <i><span class="sw keep"></span> kept</i>
+        <i><span class="sw cut"></span> removed</i>
+        <i>click to scrub</i>
+      </div>
       <div class="cd-stats" id="cd-stats"></div>
     </div>
 
     <div class="cd-actions">
       <button class="cd-btn" id="cd-go" disabled>Cut it down</button>
+      <button class="cd-btn ghost" id="cd-preview" aria-pressed="false">Preview cuts</button>
       <button class="cd-btn ghost" id="cd-reset">Start over</button>
     </div>
 

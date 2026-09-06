@@ -175,7 +175,7 @@ viewer.loadSkin('assets/skin.png', { model: 'slim' });
 
 // Optional: export your Minecraft builder cape as a PNG, drop it in
 // assets/cape.png, then uncomment the line below to render it on the model.
-// viewer.loadCape('assets/cape.png');
+viewer.loadCape('assets/cape.png');
 
 viewer.animation = new skinview3d.IdleAnimation();
 viewer.animation.speed = 0.6;

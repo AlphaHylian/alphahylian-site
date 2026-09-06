@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Strip Mine · AlphaHylian</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<meta name="description" content="Dig for ore. A little mining game by Ayan Bose (AlphaHylian).">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+<script>
+  try {
+    var t = localStorage.getItem('ah-theme');
+    if (t === 'stars' || t === 'synthwave') t = 'constellation';
+    if (t && ['constellation','terminal','minecraft','paper','nether'].indexOf(t) !== -1) {
+      document.documentElement.setAttribute('data-theme', t);
+    }
+  } catch (e) {}
+</script>
+<style>
+  body{ overflow-y:auto; }
+  .mn-page{
+    position:relative; z-index:1; min-height:100vh;
+    display:flex; flex-direction:column; align-items:center;
+    padding: 22px 18px 50px; gap:16px;
+  }
+  .mn-top{
+    width:100%; max-width:1020px;
+    display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;
+  }
+  .mn-back{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:9px 15px; border-radius:var(--panel-radius);
+    border:1px solid var(--border); background:var(--panel);
+    color:var(--text-dim); font-size:13.5px; font-weight:500; text-decoration:none;
+    transition:color .18s ease, border-color .18s ease;
+  }
+  .mn-back:hover{ color:var(--text); border-color:var(--accent); }
+  .mn-title{
+    font-family:var(--font-display); font-size:20px; font-weight:600;
+    letter-spacing:-0.01em; color:var(--text);
+  }
+  .mn-title span{ color:var(--accent-glow); }
+
+  .mn-hud{
+    width:100%; max-width:1020px;
+    display:flex; align-items:stretch; gap:10px; flex-wrap:wrap;
+  }
+  .mn-stat{
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--panel-radius); padding:10px 16px; text-align:center; min-width:96px;
+  }
+  .mn-stat b{
+    display:block; font-family:var(--font-display); font-size:21px; font-weight:700;
+    color:var(--text); font-variant-numeric:tabular-nums; line-height:1.15;
+  }
+  .mn-stat i{
+    font-style:normal; font-size:10px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--text-faint);
+  }
+  .mn-bag{
+    flex:1; min-width:220px;
+    display:flex; align-items:center; justify-content:center; gap:16px; flex-wrap:wrap;
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--panel-radius); padding:10px 16px;
+  }
+  .mn-ore{ display:flex; align-items:center; gap:7px; font-size:13.5px; color:var(--text-dim); }
+  .mn-ore span.sw{
+    width:14px; height:14px; border-radius:3px; display:inline-block;
+    box-shadow:0 0 0 1px rgba(0,0,0,.35) inset;
+  }
+  .mn-ore b{ color:var(--text); font-variant-numeric:tabular-nums; font-weight:600; }
+
+  .mn-stage{
+    position:relative; width:100%; max-width:1020px;
+    aspect-ratio:16/10; border:1px solid var(--border);
+    border-radius:var(--panel-radius); box-shadow:var(--panel-shadow);
+    background:#0a0a0c; overflow:hidden; cursor:crosshair; touch-action:none;
+  }
+  #mn-canvas{ display:block; width:100%; height:100%; }
+
+  .mn-tools{
+    width:100%; max-width:1020px;
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:center;
+  }
+  .mn-btn{
+    padding:11px 20px; border-radius:var(--panel-radius);
+    border:1px solid var(--border); background:var(--panel); color:var(--text-dim);
+    font-family:var(--font-body); font-size:13.5px; font-weight:600; cursor:pointer;
+    transition:color .16s ease, border-color .16s ease, background .16s ease;
+  }
+  .mn-btn:hover:not(:disabled){ color:var(--text); border-color:var(--accent); }
+  .mn-btn.primary{ border-color:var(--accent); background:var(--accent-deep); color:var(--text); }
+  html[data-theme="paper"] .mn-btn.primary{ color:#fff; }
+  .mn-btn:disabled{ opacity:.45; cursor:not-allowed; }
+
+  .mn-note{ max-width:1020px; font-size:12.5px; color:var(--text-faint); text-align:center; line-height:1.6; }
+
+  @media (max-width:720px){
+    .mn-stage{ aspect-ratio:3/4; }
+    .mn-top{ justify-content:center; }
+    .mn-hud{ justify-content:center; }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bg-canvas" aria-hidden="true"></canvas>
+
+<div class="mn-page">
+  <div class="mn-top">
+    <a class="mn-back" href="/">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5 8 12l7 7"/></svg>
+      Back to site
+    </a>
+    <div class="mn-title">Strip<span>Mine</span></div>
+    <div style="min-width:110px"></div>
+  </div>
+
+  <div class="mn-hud">
+    <div class="mn-stat"><b id="mn-depth">0</b><i>Depth (m)</i></div>
+    <div class="mn-stat"><b id="mn-value">0</b><i>Value</i></div>
+    <div class="mn-bag" id="mn-bag"></div>
+  </div>
+
+  <div class="mn-stage" id="mn-stage">
+    <canvas id="mn-canvas"></canvas>
+  </div>
+
+  <div class="mn-tools">
+    <button class="mn-btn primary" id="mn-upgrade" type="button">Upgrade pickaxe</button>
+    <button class="mn-btn" id="mn-reset" type="button">New mine</button>
+    <div class="mn-stat" style="min-width:150px"><b id="mn-pick">Wooden</b><i>Pickaxe</i></div>
+    <div class="mn-stat"><b id="mn-best">0</b><i>Best depth</i></div>
+  </div>
+
+  <p class="mn-note">Click and hold to dig. You can only break blocks touching air, so tunnel your way down — the good stuff is deep.</p>
+</div>
+
+<script src="/mine.js"></script>
+</body>
+</html>

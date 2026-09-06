@@ -1635,6 +1635,31 @@ function unlockNether(){
     '\uD83D\uDD25', 5200);
 }
 
+/* Touch devices have no Konami code, so holding the palette button for a
+   moment unlocks it too. The hold suppresses the click that would otherwise
+   open the menu on release. */
+const HOLD_MS = 1100;
+let holdTimer = null, heldOpen = false;
+if(themeToggle){
+  themeToggle.style.webkitTouchCallout = 'none';
+  themeToggle.style.userSelect = 'none';
+  const startHold = () => {
+    clearTimeout(holdTimer);
+    heldOpen = false;
+    holdTimer = setTimeout(() => { heldOpen = true; unlockNether(); }, HOLD_MS);
+  };
+  const cancelHold = () => clearTimeout(holdTimer);
+  themeToggle.addEventListener('pointerdown', startHold);
+  themeToggle.addEventListener('pointerup', cancelHold);
+  themeToggle.addEventListener('pointerleave', cancelHold);
+  themeToggle.addEventListener('pointercancel', cancelHold);
+  themeToggle.addEventListener('contextmenu', e => e.preventDefault());
+  // runs before the menu-toggle listener registered earlier? no — capture phase
+  themeToggle.addEventListener('click', e => {
+    if(heldOpen){ heldOpen = false; e.stopImmediatePropagation(); e.preventDefault(); }
+  }, true);
+}
+
 const KONAMI = ['arrowup','arrowup','arrowdown','arrowdown','arrowleft','arrowright','arrowleft','arrowright','b','a'];
 let konamiPos = 0;
 document.addEventListener('keydown', e => {

@@ -45,6 +45,8 @@ const mouse = { x: -9999, y: -9999 };
 window.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
 window.addEventListener('mouseleave', () => { mouse.x = -9999; mouse.y = -9999; });
 
+// Ambient background motion respects this; cursor-driven feedback does not,
+// since that's direct response to input rather than decorative movement.
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 /* ===================== TABS ===================== */
@@ -58,21 +60,25 @@ tabButtons.forEach(btn => {
     btn.classList.add('active');
     document.getElementById(`panel-${btn.dataset.tab}`).classList.add('active');
     if(btn.dataset.tab === 'home'){
-      if(typeof positionSkinCard === 'function') positionSkinCard();
-      if(typeof fitQfx === 'function') fitQfx();
-      if(typeof refreshQuoteCache === 'function') refreshQuoteCache();
+      positionSkinCard();
+      fitQfx();
+      refreshQuoteCache();
     }
   });
 });
 
 /* ===================== THEME SWITCHER ===================== */
-const THEMES = ['stars', 'terminal', 'minecraft', 'synthwave', 'paper'];
+const THEMES = ['constellation', 'terminal', 'minecraft', 'paper'];
+// Older saved values that no longer exist map onto the default.
+const THEME_ALIASES = { stars: 'constellation', synthwave: 'constellation' };
+
 const themeToggle = document.getElementById('theme-toggle');
 const themeMenu = document.getElementById('theme-menu');
 const themeOptions = [...document.querySelectorAll('.theme-option')];
 
 function applyTheme(name){
-  if(!THEMES.includes(name)) name = 'stars';
+  name = THEME_ALIASES[name] || name;
+  if(!THEMES.includes(name)) name = 'constellation';
   document.documentElement.setAttribute('data-theme', name);
   try { localStorage.setItem('ah-theme', name); } catch(e){}
   themeOptions.forEach(o => o.setAttribute('aria-checked', String(o.dataset.theme === name)));
@@ -97,16 +103,17 @@ document.addEventListener('click', e => {
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closeThemeMenu(); });
 
 /* ===================== QUOTE HOVER EFFECTS ===================== */
-// Each quote is rebuilt as per-character spans (wrapped per word so line
-// breaks stay sane). One effect is active at a time, chosen by the theme:
-//   stars    -> paintbrush: letters paint purple w/ an ink smudge + trail
-//   terminal -> editor caret box around the single hovered glyph
-//   minecraft-> hovered word gets a pixel-break highlight, poofs on exit
-//   synthwave-> nearby letters glow neon w/ an RGB split, fast decay
-//   paper    -> nearby letters turn to ink + a wavy underline follows the cursor
+// One effect is active at a time, chosen by the theme:
+//   constellation -> a purple duplicate of the text, revealed through a mask
+//                    of soft blobs along the recent cursor path (trailing paint)
+//   terminal      -> editor caret box around the single hovered glyph
+//   minecraft     -> hovered word gets a block-break highlight, poofs on exit
+//   paper         -> an accurate pen stroke that follows the cursor anywhere
+//                    on the panel and slowly dries away
 const quoteBody = document.querySelector('.quote-body');
 const quoteTextEl = document.getElementById('quote-text');
 const quoteAuthorEl = document.getElementById('quote-author');
+const paintLayer = document.getElementById('quote-paint');
 const qCard = document.querySelector('.quote-card');
 const qfxCanvas = document.getElementById('quote-fx');
 const qfxCtx = qfxCanvas.getContext('2d');
@@ -130,7 +137,32 @@ function buildQuoteSpans(el, text){
   });
 }
 
-function quoteChars(){ return [...quoteBody.querySelectorAll('.q-ch')]; }
+// Exact duplicate of the live quote, used as the constellation paint layer.
+// Cloning keeps the layout identical, so the purple copy sits pixel-perfect
+// on top of the real text; ids are stripped to avoid duplicates in the DOM.
+function buildPaintLayer(){
+  paintLayer.textContent = '';
+  [quoteTextEl, quoteAuthorEl].forEach(src => {
+    const clone = src.cloneNode(true);
+    clone.removeAttribute('id');
+    paintLayer.appendChild(clone);
+  });
+}
+function clearPaintLayer(){
+  paintLayer.textContent = '';
+  paintLayer.style.opacity = '0';
+  paintLayer.style.webkitMaskImage = '';
+  paintLayer.style.maskImage = '';
+}
+
+// Scoped to the real text only — the constellation paint layer is a clone that
+// also lives inside .quote-body, and its spans must never enter the caches.
+function quoteChars(){
+  return [...quoteTextEl.querySelectorAll('.q-ch'), ...quoteAuthorEl.querySelectorAll('.q-ch')];
+}
+function quoteWords(){
+  return [...quoteTextEl.querySelectorAll('.q-word'), ...quoteAuthorEl.querySelectorAll('.q-word')];
+}
 
 function fitQfx(){
   const r = qCard.getBoundingClientRect();
@@ -143,14 +175,16 @@ function fitQfx(){
 let charCache = [];
 let wordCache = [];
 let qfxRect = { left: 0, top: 0 };
+let bodyRect = { left: 0, top: 0 };
 function refreshQuoteCache(){
   qfxRect = qfxCanvas.getBoundingClientRect();
+  bodyRect = quoteBody.getBoundingClientRect();
   charCache = quoteChars().map(el => {
     const r = el.getBoundingClientRect();
     return { el, cx: r.left + r.width / 2, cy: r.top + r.height / 2,
              left: r.left, right: r.right, top: r.top, bottom: r.bottom };
   });
-  wordCache = [...quoteBody.querySelectorAll('.q-word')].map(el => {
+  wordCache = quoteWords().map(el => {
     const r = el.getBoundingClientRect();
     return { el, left: r.left, right: r.right, top: r.top, bottom: r.bottom };
   });
@@ -168,113 +202,86 @@ let activeQfx = null;
 function setQuoteEffect(name){
   if(activeQfx && activeQfx.stop) activeQfx.stop();
   qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
-  quoteBody.querySelectorAll('.q-ch, .q-word').forEach(s => {
+  clearPaintLayer();
+  [...quoteChars(), ...quoteWords()].forEach(s => {
     s.style.color = ''; s.style.textShadow = ''; s.style.transform = '';
     s.classList.remove('q-box', 'q-break');
   });
-  const factory = QuoteEffects[name] || QuoteEffects.stars;
+  const factory = QuoteEffects[name] || QuoteEffects.constellation;
   activeQfx = factory();
   if(activeQfx.onRender) activeQfx.onRender();
 }
 
-quoteBody.addEventListener('mousemove', e => {
+// Listeners live on the whole card, not just the text, so effects can react to
+// the cursor being *near* the words (and so paper can draw across the panel).
+qCard.addEventListener('mousemove', e => {
   if(activeQfx && activeQfx.onMove) activeQfx.onMove(e);
 });
-quoteBody.addEventListener('mouseleave', () => {
+qCard.addEventListener('mouseleave', () => {
   if(activeQfx && activeQfx.onLeave) activeQfx.onLeave();
 });
-quoteBody.addEventListener('touchmove', e => {
+qCard.addEventListener('touchmove', e => {
   const t = e.touches[0];
   if(t && activeQfx && activeQfx.onMove) activeQfx.onMove({ clientX: t.clientX, clientY: t.clientY });
 }, { passive: true });
 
-/* ---- stars: paintbrush ---- */
-QuoteEffects.stars = () => {
-  const BRUSH_RADIUS = 46;   // px around the cursor that gets painted
-  const PAINT_DECAY = 0.02;  // per frame — ~1.2s to fade a painted letter back
-  const TRAIL_MS = 700;
-  let painted = new WeakMap();
-  let trail = [];
+/* ---- constellation: purple paint revealed through a trailing mask ---- */
+QuoteEffects.constellation = () => {
+  const TRAIL_MS = 950;    // how long a painted spot lingers
+  const BLOB_R = 54;       // radius of the brush at the cursor
+  const MAX_PTS = 16;      // mask layers — keep modest, each one costs
+  const MIN_STEP = 9;      // px between recorded points
+  let pts = [];
   let raf = 0, running = true;
 
-  function onRender(){
-    refreshQuoteCache();
-    painted = new WeakMap();
-    charCache.forEach(c => { c.el.style.color = ''; c.el.style.textShadow = ''; c.el.style.transform = ''; });
-  }
-  function onMove(e){
-    const mx = e.clientX - qfxRect.left, my = e.clientY - qfxRect.top;
-    trail.push({ x: mx, y: my, t: performance.now() });
-    if(trail.length > 30) trail.shift();
-    for(const c of charCache){
-      if(Math.hypot(c.cx - e.clientX, c.cy - e.clientY) < BRUSH_RADIUS){
-        const prev = painted.get(c.el);
-        const p = {
-          level: 1,
-          jx: prev ? prev.jx : (Math.random() - 0.5) * 2.4,
-          jy: prev ? prev.jy : (Math.random() - 0.5) * 2.4,
-          rot: prev ? prev.rot : (Math.random() - 0.5) * 8
-        };
-        painted.set(c.el, p);
-        applyPaint(c.el, p);   // show immediately, even if the decay loop is off
-      }
-    }
-  }
-  function onLeave(){ /* trail + paint fade on their own */ }
+  function onRender(){ buildPaintLayer(); }
 
-  function applyPaint(el, p){
-    const l = p.level;
-    el.style.color = `rgba(168,136,255,${(0.55 + 0.45 * l).toFixed(3)})`;
-    el.style.textShadow =
-      `0 0 ${(6 * l).toFixed(1)}px rgba(138,108,242,${(0.7 * l).toFixed(2)}),` +
-      `0 0 ${(15 * l).toFixed(1)}px rgba(138,108,242,${(0.4 * l).toFixed(2)})`;
-    el.style.transform =
-      `translate(${(p.jx * l).toFixed(2)}px,${(p.jy * l).toFixed(2)}px) rotate(${(p.rot * l).toFixed(2)}deg)`;
+  function onMove(e){
+    const x = e.clientX - bodyRect.left;
+    const y = e.clientY - bodyRect.top;
+    const last = pts[pts.length - 1];
+    if(last && Math.hypot(x - last.x, y - last.y) < MIN_STEP){
+      last.t = performance.now();   // resting on a spot keeps it wet
+      return;
+    }
+    pts.push({ x, y, t: performance.now() });
+    if(pts.length > MAX_PTS) pts.shift();
+    apply();
+  }
+  function onLeave(){}
+
+  function apply(){
+    const now = performance.now();
+    const layers = [];
+    for(const p of pts){
+      const age = (now - p.t) / TRAIL_MS;
+      if(age >= 1) continue;
+      const a = Math.pow(1 - age, 1.5);
+      const rad = BLOB_R * (0.62 + 0.38 * (1 - age));
+      layers.push(
+        `radial-gradient(circle ${rad.toFixed(1)}px at ${p.x.toFixed(1)}px ${p.y.toFixed(1)}px,` +
+        ` rgba(0,0,0,${a.toFixed(3)}) 0%,` +
+        ` rgba(0,0,0,${(a * 0.8).toFixed(3)}) 45%,` +
+        ` rgba(0,0,0,0) 100%)`
+      );
+    }
+    if(!layers.length){ paintLayer.style.opacity = '0'; return; }
+    const s = layers.join(',');
+    paintLayer.style.opacity = '1';
+    paintLayer.style.webkitMaskImage = s;
+    paintLayer.style.maskImage = s;
   }
 
   function loop(){
     if(!running) return;
-    const now = performance.now();
-    for(const c of charCache){
-      const p = painted.get(c.el);
-      if(!p) continue;
-      p.level -= PAINT_DECAY;
-      if(p.level <= 0){
-        painted.delete(c.el);
-        c.el.style.color = ''; c.el.style.textShadow = ''; c.el.style.transform = '';
-        continue;
-      }
-      applyPaint(c.el, p);
-    }
-
-    qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
-    for(let i = 0; i < trail.length; i++){
-      const pt = trail[i];
-      const age = (now - pt.t) / TRAIL_MS;
-      if(age >= 1) continue;
-      const a = (1 - age) * (i / trail.length);
-      const rad = 10 + i * 0.7;
-      const g = qfxCtx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, rad);
-      g.addColorStop(0, `rgba(138,108,242,${(0.5 * a).toFixed(3)})`);
-      g.addColorStop(1, 'rgba(138,108,242,0)');
-      qfxCtx.fillStyle = g;
-      qfxCtx.beginPath();
-      qfxCtx.arc(pt.x, pt.y, rad, 0, Math.PI * 2);
-      qfxCtx.fill();
-    }
-    trail = trail.filter(pt => now - pt.t < TRAIL_MS);
+    if(pts.length) apply();
     raf = requestAnimationFrame(loop);
   }
-  if(!prefersReducedMotion) raf = requestAnimationFrame(loop);
+  raf = requestAnimationFrame(loop);
 
   return {
     onMove, onLeave, onRender,
-    stop(){
-      running = false;
-      cancelAnimationFrame(raf);
-      qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
-      quoteChars().forEach(el => { el.style.color = ''; el.style.textShadow = ''; el.style.transform = ''; });
-    }
+    stop(){ running = false; cancelAnimationFrame(raf); clearPaintLayer(); }
   };
 };
 
@@ -351,105 +358,71 @@ QuoteEffects.minecraft = () => {
     current = hit;
   }
   function onLeave(){
-    if(current){ current.classList.remove('q-break'); if(!prefersReducedMotion) poof(current); current = null; }
+    if(current){ current.classList.remove('q-break'); poof(current); current = null; }
   }
   return {
     onMove, onLeave, onRender,
     stop(){
-      quoteBody.querySelectorAll('.q-word').forEach(el => el.classList.remove('q-break'));
+      quoteWords().forEach(el => el.classList.remove('q-break'));
       qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
     }
   };
 };
 
-/* ---- synthwave: neon glow ---- */
-QuoteEffects.synthwave = () => {
-  const REACH = 60;
-  let lvl = new WeakMap();
-  let raf = 0, running = true;
-  function onRender(){ refreshQuoteCache(); lvl = new WeakMap(); charCache.forEach(c => { c.el.style.color = ''; c.el.style.textShadow = ''; }); }
-  function glow(el, l){
-    el.style.color = '#ffffff';
-    el.style.textShadow =
-      `${(-2 * l).toFixed(1)}px 0 rgba(255,45,149,${(0.9 * l).toFixed(2)}),` +
-      `${(2 * l).toFixed(1)}px 0 rgba(0,229,255,${(0.9 * l).toFixed(2)}),` +
-      `0 0 ${(12 * l).toFixed(1)}px rgba(255,45,149,${(0.7 * l).toFixed(2)})`;
-  }
-  function onMove(e){
-    for(const c of charCache){
-      const d = Math.hypot(c.cx - e.clientX, c.cy - e.clientY);
-      if(d < REACH){
-        const nl = Math.max(lvl.get(c.el) || 0, 1 - d / REACH);
-        lvl.set(c.el, nl);
-        glow(c.el, nl);   // show immediately, even if the decay loop is off
-      }
-    }
-  }
-  function onLeave(){}
-  function loop(){
-    if(!running) return;
-    for(const c of charCache){
-      let l = lvl.get(c.el);
-      if(l == null) continue;
-      l -= 0.06;
-      if(l <= 0){ lvl.delete(c.el); c.el.style.color = ''; c.el.style.textShadow = ''; continue; }
-      lvl.set(c.el, l);
-      glow(c.el, l);
-    }
-    raf = requestAnimationFrame(loop);
-  }
-  if(!prefersReducedMotion) raf = requestAnimationFrame(loop);
-  return {
-    onMove, onLeave, onRender,
-    stop(){ running = false; cancelAnimationFrame(raf); quoteChars().forEach(el => { el.style.color = ''; el.style.textShadow = ''; }); }
-  };
-};
-
-/* ---- paper: ink + wavy underline ---- */
+/* ---- paper: a pen stroke that traces the cursor across the whole panel ---- */
 QuoteEffects.paper = () => {
-  const REACH = 44;
-  const STROKE_MS = 900;
+  const STROKE_MS = 2400;  // how long the ink takes to dry away
+  const MIN_STEP = 3;      // px between recorded points
+  const MAX_PTS = 420;
+  const CHUNK = 14;        // segments per stroked path — batching keeps it cheap
   let pts = [];
-  let inked = new Set();
   let raf = 0, running = true;
-  function onRender(){ refreshQuoteCache(); pts = []; inked.forEach(el => el.style.color = ''); inked = new Set(); }
+
+  function onRender(){ refreshQuoteCache(); pts = []; }
   function onMove(e){
-    pts.push({ x: e.clientX - qfxRect.left, y: e.clientY - qfxRect.top + 9, t: performance.now() });
-    if(pts.length > 46) pts.shift();
-    for(const c of charCache){
-      if(Math.hypot(c.cx - e.clientX, c.cy - e.clientY) < REACH){
-        c.el.style.color = 'var(--accent)';
-        inked.add(c.el);
-      }
-    }
+    const x = e.clientX - qfxRect.left;
+    const y = e.clientY - qfxRect.top;
+    const last = pts[pts.length - 1];
+    if(last && Math.hypot(x - last.x, y - last.y) < MIN_STEP) return;
+    pts.push({ x, y, t: performance.now(), brk: false });
+    if(pts.length > MAX_PTS) pts.shift();
   }
-  function onLeave(){}
+  // Pen lifts when the cursor leaves the panel — don't join across the gap.
+  function onLeave(){ if(pts.length) pts[pts.length - 1].brk = true; }
+
   function loop(){
     if(!running) return;
     const now = performance.now();
-    pts = pts.filter(p => now - p.t < STROKE_MS);
+    while(pts.length && now - pts[0].t > STROKE_MS) pts.shift();
     qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
     qfxCtx.lineCap = 'round';
     qfxCtx.lineJoin = 'round';
-    for(let i = 1; i < pts.length; i++){
-      const p0 = pts[i - 1], p1 = pts[i];
-      const age = (now - p1.t) / STROKE_MS;
-      const a = (1 - age) * 0.8;
-      const w0 = Math.sin((i - 1) * 0.9 + now * 0.008) * 1.6;
-      const w1 = Math.sin(i * 0.9 + now * 0.008) * 1.6;
-      qfxCtx.strokeStyle = `rgba(53,80,112,${a.toFixed(3)})`;
-      qfxCtx.lineWidth = 2.4 * (1 - age) + 0.4;
+
+    for(let start = 0; start < pts.length - 1; start += CHUNK){
+      const end = Math.min(pts.length - 1, start + CHUNK);
+      const mid = pts[(start + end) >> 1];
+      const age = (now - mid.t) / STROKE_MS;
+      const alpha = Math.max(0, 1 - age) * 0.85;
+      if(alpha <= 0.01) continue;
+      qfxCtx.strokeStyle = `rgba(38,29,19,${alpha.toFixed(3)})`;
+      qfxCtx.lineWidth = 2.5 * (1 - age * 0.55) + 0.5;
       qfxCtx.beginPath();
-      qfxCtx.moveTo(p0.x, p0.y + w0);
-      qfxCtx.lineTo(p1.x, p1.y + w1);
+      let penDown = false;
+      for(let i = start; i <= end; i++){
+        const p = pts[i];
+        if(!penDown){ qfxCtx.moveTo(p.x, p.y); penDown = true; }
+        else qfxCtx.lineTo(p.x, p.y);
+        if(p.brk) penDown = false;
+      }
       qfxCtx.stroke();
     }
     raf = requestAnimationFrame(loop);
   }
-  if(!prefersReducedMotion) raf = requestAnimationFrame(loop);
+  raf = requestAnimationFrame(loop);
+
   return {
     onMove, onLeave, onRender,
-    stop(){ running = false; cancelAnimationFrame(raf); qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height); inked.forEach(el => el.style.color = ''); }
+    stop(){ running = false; cancelAnimationFrame(raf); qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height); }
   };
 };
 
@@ -483,6 +456,7 @@ function renderQuote(){
   buildQuoteSpans(quoteAuthorEl, quotes[quoteIndex].author ? `— ${quotes[quoteIndex].author}` : '');
   // Re-toggling 'active' restarts each dot's CSS fill animation from scratch.
   [...dotsWrap.children].forEach((d, i) => d.classList.toggle('active', i === quoteIndex));
+  refreshQuoteCache();
   if(activeQfx && activeQfx.onRender) activeQfx.onRender();
 }
 
@@ -514,26 +488,25 @@ renderQuote();
 restartQuoteTimer();
 
 /* ===================== ABOUT PHOTO REVEAL ===================== */
+// Tracked globally, so the hole keeps following the cursor even when it's off
+// the image. The radius only needs to be big enough that parking the cursor on
+// the nametag uncovers the whole name.
 const aboutPhoto = document.getElementById('about-photo');
 const photoTop = document.getElementById('photo-top');
+const REVEAL_INNER = 0.42;   // × photo width — solid reveal
+const REVEAL_OUTER = 0.52;   // × photo width — feathered edge
 
 function setPhotoPos(x, y){
   const rect = aboutPhoto.getBoundingClientRect();
-  // Radius scales with the photo so a cursor at the centre uncovers the whole
-  // nametag (half the diagonal reaches every corner).
-  const reach = Math.hypot(rect.width, rect.height) / 2;
-  photoTop.style.setProperty('--mx', `${x - rect.left}px`);
-  photoTop.style.setProperty('--my', `${y - rect.top}px`);
-  photoTop.style.setProperty('--r0', `${(reach * 0.92).toFixed(1)}px`);
-  photoTop.style.setProperty('--r1', `${(reach * 1.1).toFixed(1)}px`);
+  if(!rect.width) return;
+  photoTop.style.setProperty('--mx', `${(x - rect.left).toFixed(1)}px`);
+  photoTop.style.setProperty('--my', `${(y - rect.top).toFixed(1)}px`);
+  photoTop.style.setProperty('--r0', `${(rect.width * REVEAL_INNER).toFixed(1)}px`);
+  photoTop.style.setProperty('--r1', `${(rect.width * REVEAL_OUTER).toFixed(1)}px`);
 }
 
-aboutPhoto.addEventListener('mousemove', e => setPhotoPos(e.clientX, e.clientY));
-aboutPhoto.addEventListener('mouseleave', () => {
-  photoTop.style.setProperty('--mx', '-400px');
-  photoTop.style.setProperty('--my', '-400px');
-});
-aboutPhoto.addEventListener('touchmove', e => {
+window.addEventListener('mousemove', e => setPhotoPos(e.clientX, e.clientY));
+window.addEventListener('touchmove', e => {
   const t = e.touches[0];
   if(t) setPhotoPos(t.clientX, t.clientY);
 }, { passive: true });
@@ -639,6 +612,41 @@ window.addEventListener('touchmove', dragMove, { passive: true });
 window.addEventListener('mouseup', endDrag);
 window.addEventListener('touchend', endDrag);
 
+/* ---- punch on click ----
+   IdleAnimation drives the arms every frame, so it's swapped out for the
+   duration of the swing and restored when the arm is back at rest. */
+const PUNCH_MS = 340;
+const PUNCH_REACH = 1.75;   // radians the right arm swings forward
+let punchStart = -1;
+let savedAnimation = null;
+
+function triggerPunch(){
+  if(!viewer || !viewer.playerObject || punchStart >= 0) return;
+  savedAnimation = viewer.animation;
+  viewer.animation = null;
+  punchStart = performance.now();
+}
+window.addEventListener('mousedown', triggerPunch);
+window.addEventListener('touchstart', triggerPunch, { passive: true });
+
+function updatePunch(){
+  if(punchStart < 0) return;
+  const skin = viewer.playerObject && viewer.playerObject.skin;
+  const arm = skin && skin.rightArm;
+  if(!arm){ punchStart = -1; viewer.animation = savedAnimation; return; }
+  const p = Math.min(1, (performance.now() - punchStart) / PUNCH_MS);
+  const swing = p < 0.34 ? p / 0.34 : 1 - (p - 0.34) / 0.66;
+  const ease = swing * swing * (3 - 2 * swing);   // smoothstep
+  arm.rotation.x = -PUNCH_REACH * ease;
+  arm.rotation.z = 0.1 * ease;
+  if(p >= 1){
+    arm.rotation.x = 0;
+    arm.rotation.z = 0;
+    viewer.animation = savedAnimation;
+    punchStart = -1;
+  }
+}
+
 function overflowPast(value, limit){
   if(value > limit) return value - limit;
   if(value < -limit) return value + limit;
@@ -647,6 +655,8 @@ function overflowPast(value, limit){
 
 function updateHeadLook(){
   if(!viewer) return;
+  updatePunch();
+
   const wrapper = viewer.playerWrapper;
   const head = viewer.playerObject && viewer.playerObject.skin.head;
 
@@ -696,7 +706,8 @@ updateHeadLook();
 
 /* ===================== INTERACTIVE BACKGROUND ENGINE ===================== */
 // A theme owns its background. setBackground() tears the current one down
-// (stops its RAF + resize listener) and starts the new one.
+// (stops its RAF + resize listener) and starts the new one. Each background
+// may expose click(x, y) for its own click effect.
 const bgCanvas = document.getElementById('bg-canvas');
 const bgCtx = bgCanvas.getContext('2d');
 let bgW = 0, bgH = 0;
@@ -716,7 +727,7 @@ function makeBg(build){
       fitBgCanvas();
       if(api.init) api.init();
       window.addEventListener('resize', onResize);
-      if(prefersReducedMotion){ if(api.frame) api.frame(16, 0); return; }
+      if(prefersReducedMotion){ if(api.frame) api.frame(16, performance.now()); return; }
       running = true;
       last = performance.now();
       const loop = now => {
@@ -732,6 +743,12 @@ function makeBg(build){
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', onResize);
       if(api.teardown) api.teardown();
+    },
+    click(x, y){
+      if(!api.click) return;
+      api.click(x, y);
+      // With animation suppressed there's no loop to show it, so repaint once.
+      if(prefersReducedMotion && api.frame) api.frame(16, performance.now());
     }
   };
 }
@@ -742,14 +759,18 @@ let activeBg = null;
 function setBackground(name){
   if(activeBg && activeBg.stop) activeBg.stop();
   bgCtx.clearRect(0, 0, bgW, bgH);
-  const factory = Backgrounds[name] || Backgrounds.stars;
+  const factory = Backgrounds[name] || Backgrounds.constellation;
   activeBg = factory();
   activeBg.start();
 }
 
-/* ---- stars: spawning/dying constellation + calm ambient layer ---- */
-Backgrounds.stars = () => makeBg(() => {
-  let bright = [], ambient = [];
+window.addEventListener('mousedown', e => {
+  if(activeBg && activeBg.click) activeBg.click(e.clientX, e.clientY);
+});
+
+/* ---- constellation: spawning/dying stars + calm ambient layer ---- */
+Backgrounds.constellation = () => makeBg(() => {
+  let bright = [], ambient = [], waves = [];
   const rand = () => Math.random();
 
   function makeBright(){
@@ -760,7 +781,8 @@ Backgrounds.stars = () => makeBg(() => {
       age: 0,
       life: 6000 + rand() * 10000,   // 6–16s before it dies and respawns elsewhere
       fadeIn: 900 + rand() * 500,
-      fadeOut: 1200 + rand() * 700
+      fadeOut: 1200 + rand() * 700,
+      flare: 0
     };
   }
   function makeAmbient(){
@@ -785,10 +807,23 @@ Backgrounds.stars = () => makeBg(() => {
     bright = Array.from({ length: bCount }, makeBright);
     bright.forEach(p => { p.age = rand() * p.life; });   // stagger the lifecycle
     ambient = Array.from({ length: aCount }, makeAmbient);
+    waves = [];
+  }
+
+  // Click sends out a shockwave that shoves stars aside and flares them up.
+  const WAVE_MS = 900;
+  const WAVE_SPEED = 620;     // px/s
+  function click(x, y){
+    waves.push({ x, y, t: performance.now() });
+    if(waves.length > 5) waves.shift();
   }
 
   function frame(dt, t){
     bgCtx.clearRect(0, 0, bgW, bgH);
+
+    for(let i = waves.length - 1; i >= 0; i--){
+      if(t - waves[i].t > WAVE_MS) waves.splice(i, 1);
+    }
 
     // ambient layer — behind, dim, barely moves, ignores the cursor
     for(const p of ambient){
@@ -807,6 +842,7 @@ Backgrounds.stars = () => makeBg(() => {
       p.x += p.vx; p.y += p.vy;
       if(p.x < 0 || p.x > bgW) p.vx *= -1;
       if(p.y < 0 || p.y > bgH) p.vy *= -1;
+
       const dx = p.x - mouse.x, dy = p.y - mouse.y;
       const dist = Math.hypot(dx, dy);
       if(dist < 170 && dist > 0.001){
@@ -814,13 +850,41 @@ Backgrounds.stars = () => makeBg(() => {
         p.x += (dx / dist) * force * 5.5;
         p.y += (dy / dist) * force * 5.5;
       }
+
+      for(const w of waves){
+        const age = (t - w.t) / WAVE_MS;
+        const ring = age * WAVE_SPEED;
+        const wx = p.x - w.x, wy = p.y - w.y;
+        const d = Math.hypot(wx, wy);
+        const band = Math.abs(d - ring);
+        if(band < 70 && d > 0.001){
+          const push = (1 - band / 70) * (1 - age) * 7;
+          p.x += (wx / d) * push;
+          p.y += (wy / d) * push;
+          p.flare = Math.max(p.flare, (1 - band / 70) * (1 - age));
+        }
+      }
+      p.flare *= 0.94;
       p._e = envelope(p);
     }
 
     for(const p of bright){
-      bgCtx.fillStyle = `rgba(150,120,255,${(0.78 * p._e).toFixed(3)})`;
-      bgCtx.fillRect(p.x, p.y, p.size, p.size);
+      const a = 0.78 * p._e + p.flare * 0.9;
+      bgCtx.fillStyle = `rgba(${(150 + p.flare * 105) | 0},${(120 + p.flare * 110) | 0},255,${Math.min(1, a).toFixed(3)})`;
+      const s = p.size + (p.flare > 0.4 ? 1 : 0);
+      bgCtx.fillRect(p.x, p.y, s, s);
     }
+
+    // faint expanding ring so the shockwave reads even in sparse areas
+    for(const w of waves){
+      const age = (t - w.t) / WAVE_MS;
+      bgCtx.strokeStyle = `rgba(168,136,255,${(0.35 * (1 - age)).toFixed(3)})`;
+      bgCtx.lineWidth = 2 * (1 - age) + 0.5;
+      bgCtx.beginPath();
+      bgCtx.arc(w.x, w.y, age * WAVE_SPEED, 0, Math.PI * 2);
+      bgCtx.stroke();
+    }
+
     for(let i = 0; i < bright.length; i++){
       const a = bright[i];
       for(let j = i + 1; j < bright.length; j++){
@@ -841,13 +905,18 @@ Backgrounds.stars = () => makeBg(() => {
     }
   }
 
-  return { init, resize: init, frame };
+  return { init, resize: init, frame, click };
 });
 
-/* ---- terminal: subtly falling 1s and 0s that brighten under the cursor ---- */
+/* ---- terminal: dim falling 1s and 0s; clicking sends a bright ring ---- */
 Backgrounds.terminal = () => makeBg(() => {
   const FONT = 14, COL = 14, ROW = 16;
+  const BASE_ALPHA = 0.03;    // dim, and deliberately unaffected by the cursor
+  const PULSE_MS = 1500;
+  const PULSE_SPEED = 720;    // px/s
+  const PULSE_BAND = 60;
   let cols = 0, rows = 0, totalH = 0, offs = [], speed = [], glyphs = [];
+  let pulses = [];
 
   function init(){
     cols = Math.ceil(bgW / COL) + 1;
@@ -858,13 +927,23 @@ Backgrounds.terminal = () => makeBg(() => {
     // Sparse: most cells are empty, so the rain stays faint and cheap to draw.
     glyphs = Array.from({ length: cols }, () =>
       Array.from({ length: rows }, () => (Math.random() < 0.3 ? (Math.random() < 0.5 ? '0' : '1') : null)));
+    pulses = [];
+  }
+
+  function click(x, y){
+    pulses.push({ x, y, t: performance.now() });
+    if(pulses.length > 4) pulses.shift();
   }
 
   function frame(dt, t){
-    bgCtx.fillStyle = 'rgba(4,16,10,0.34)';   // trailing fade
+    bgCtx.fillStyle = 'rgba(4,16,10,0.45)';   // trailing fade
     bgCtx.fillRect(0, 0, bgW, bgH);
     bgCtx.font = `${FONT}px 'JetBrains Mono', ui-monospace, Menlo, monospace`;
     bgCtx.textBaseline = 'top';
+
+    for(let i = pulses.length - 1; i >= 0; i--){
+      if(t - pulses[i].t > PULSE_MS) pulses.splice(i, 1);
+    }
 
     for(let c = 0; c < cols; c++){
       offs[c] = (offs[c] + speed[c] * dt / 1000) % totalH;
@@ -873,11 +952,14 @@ Backgrounds.terminal = () => makeBg(() => {
         const g = glyphs[c][r];
         if(g === null) continue;
         const y = (r * ROW + offs[c]) % totalH - ROW;
-        const dx = x - mouse.x, dy = y - mouse.y;
-        const d = Math.hypot(dx, dy);
-        let a = 0.055;
-        if(d < 140) a = 0.055 + (1 - d / 140) * 0.85;
-        bgCtx.fillStyle = `rgba(53,255,133,${a.toFixed(3)})`;
+        let a = BASE_ALPHA;
+        for(const p of pulses){
+          const age = (t - p.t) / PULSE_MS;
+          const ring = age * PULSE_SPEED;
+          const band = Math.abs(Math.hypot(x - p.x, y - p.y) - ring);
+          if(band < PULSE_BAND) a += (1 - band / PULSE_BAND) * (1 - age) * 0.9;
+        }
+        bgCtx.fillStyle = `rgba(53,255,133,${Math.min(1, a).toFixed(3)})`;
         bgCtx.fillText(g, x, y);
       }
       if(Math.random() < 0.04){
@@ -887,211 +969,201 @@ Backgrounds.terminal = () => makeBg(() => {
     }
   }
 
-  return { init, resize: init, frame };
+  return { init, resize: init, frame, click };
 });
 
-/* ---- minecraft: slow-falling iso blocks that light up near the cursor ---- */
+/* ---- minecraft: a cave wall of blocks lit by a torch that follows the cursor;
+       clicking mines the block under it ---- */
 Backgrounds.minecraft = () => makeBg(() => {
-  let cubes = [];
-  const PALETTES = [
-    ['#7bbf3a', '#5a9e2a', '#3f7a1c'],   // grass
-    ['#9c8a6c', '#877559', '#6a5a42'],   // dirt
-    ['#9a9a9a', '#828282', '#666666'],   // stone
-    ['#6ec6e6', '#57a9c9', '#3f87a6']    // diamond
+  const CELL = 42;            // block size in px
+  const TORCH_R = 430;        // torchlight radius
+  let field = null;           // offscreen canvas: the wall at full brightness
+  let motes = [];
+  let breaks = [];
+  let parts = [];
+  let flick = 0;
+
+  const ORES = [
+    { c: '#3a3a3e', chance: 0.030 },   // coal
+    { c: '#d9c1a2', chance: 0.018 },   // iron
+    { c: '#f2d24a', chance: 0.008 },   // gold
+    { c: '#7ce9e0', chance: 0.005 },   // diamond
+    { c: '#e04a4a', chance: 0.009 }    // redstone
   ];
 
-  function shade(hex, lift){
-    const n = parseInt(hex.slice(1), 16);
-    let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
-    r = Math.min(255, r + lift * 95);
-    g = Math.min(255, g + lift * 95);
-    b = Math.min(255, b + lift * 95);
-    return `rgb(${r | 0},${g | 0},${b | 0})`;
-  }
-  function makeCube(fromTop){
-    const layer = 0.5 + Math.random() * 1.7;
-    return {
-      x: Math.random() * bgW,
-      y: fromTop ? -60 - Math.random() * bgH * 0.5 : Math.random() * bgH,
-      s: 12 + layer * 9,
-      vy: 7 + layer * 15,
-      vx: (Math.random() - 0.5) * 6,
-      sway: Math.random() * Math.PI * 2,
-      swaySpeed: 0.4 + Math.random() * 0.5,
-      col: PALETTES[(Math.random() * PALETTES.length) | 0],
-      glow: 0
-    };
-  }
-  function drawCube(c){
-    const w = c.s, h = c.s * 0.55, l = c.glow;
-    bgCtx.save();
-    bgCtx.translate(c.x, c.y);
-    bgCtx.rotate(Math.sin(c.sway) * 0.05);
-    bgCtx.beginPath();                       // top
-    bgCtx.moveTo(0, -h); bgCtx.lineTo(w, 0); bgCtx.lineTo(0, h); bgCtx.lineTo(-w, 0);
-    bgCtx.closePath();
-    bgCtx.fillStyle = shade(c.col[0], l); bgCtx.fill();
-    bgCtx.beginPath();                       // left face
-    bgCtx.moveTo(-w, 0); bgCtx.lineTo(0, h); bgCtx.lineTo(0, h + c.s); bgCtx.lineTo(-w, c.s);
-    bgCtx.closePath();
-    bgCtx.fillStyle = shade(c.col[2], l); bgCtx.fill();
-    bgCtx.beginPath();                       // right face
-    bgCtx.moveTo(w, 0); bgCtx.lineTo(0, h); bgCtx.lineTo(0, h + c.s); bgCtx.lineTo(w, c.s);
-    bgCtx.closePath();
-    bgCtx.fillStyle = shade(c.col[1], l); bgCtx.fill();
-    bgCtx.restore();
-  }
+  const clamp255 = v => Math.max(0, Math.min(255, v | 0));
 
-  function init(){
-    const count = Math.min(64, Math.floor(bgW * bgH / 26000));
-    cubes = Array.from({ length: count }, () => makeCube(false));
-  }
+  // The wall never moves, so it's rendered once into an offscreen canvas and
+  // each frame is just that image plus a lighting pass — two draws, not 10k.
+  function buildField(){
+    field = document.createElement('canvas');
+    field.width = Math.max(1, bgW);
+    field.height = Math.max(1, bgH);
+    const f = field.getContext('2d');
+    const cols = Math.ceil(bgW / CELL), rows = Math.ceil(bgH / CELL);
+    const px = CELL / 8;
 
-  function frame(dt){
-    bgCtx.fillStyle = '#17150f';
-    bgCtx.fillRect(0, 0, bgW, bgH);
-    const sec = dt / 1000;
-    for(const c of cubes){
-      c.y += c.vy * sec;
-      c.x += c.vx * sec;
-      c.sway += c.swaySpeed * sec;
-      const dx = c.x - mouse.x, dy = c.y - mouse.y;
-      const d = Math.hypot(dx, dy);
-      const target = d < 150 ? 1 - d / 150 : 0;
-      c.glow += (target - c.glow) * 0.1;
-      if(d < 150 && d > 0.001){
-        const f = (150 - d) / 150;
-        c.x += (dx / d) * f * 1.3;
-        c.y += (dy / d) * f * 1.3;
+    for(let cx = 0; cx < cols; cx++){
+      for(let cy = 0; cy < rows; cy++){
+        const x = cx * CELL, y = cy * CELL;
+        const dirt = Math.random() < 0.15;
+        const base = dirt ? [124, 94, 62] : [124, 122, 120];
+        f.fillStyle = `rgb(${base[0]},${base[1]},${base[2]})`;
+        f.fillRect(x, y, CELL, CELL);
+
+        for(let i = 0; i < 24; i++){          // pixel noise = block texture
+          const n = (Math.random() - 0.5) * 46;
+          f.fillStyle = `rgb(${clamp255(base[0] + n)},${clamp255(base[1] + n)},${clamp255(base[2] + n)})`;
+          f.fillRect(x + ((Math.random() * 8) | 0) * px, y + ((Math.random() * 8) | 0) * px, px, px);
+        }
+
+        for(const ore of ORES){               // an occasional ore vein
+          if(Math.random() < ore.chance){
+            f.fillStyle = ore.c;
+            const n = 3 + ((Math.random() * 4) | 0);
+            for(let i = 0; i < n; i++){
+              f.fillRect(x + (1 + ((Math.random() * 6) | 0)) * px,
+                         y + (1 + ((Math.random() * 6) | 0)) * px, px, px);
+            }
+            break;
+          }
+        }
+
+        f.fillStyle = 'rgba(0,0,0,0.22)';     // block seams
+        f.fillRect(x, y + CELL - px / 2, CELL, px / 2);
+        f.fillRect(x + CELL - px / 2, y, px / 2, CELL);
       }
-      if(c.y - c.s > bgH) Object.assign(c, makeCube(true));
-      drawCube(c);
     }
   }
 
-  return { init, resize: init, frame };
-});
-
-/* ---- synthwave: neon sun + scrolling perspective grid ---- */
-Backgrounds.synthwave = () => makeBg(() => {
-  let scroll = 0, stars = [];
-
   function init(){
-    stars = Array.from({ length: 90 }, () => ({
+    buildField();
+    breaks = [];
+    parts = [];
+    motes = Array.from({ length: 70 }, () => ({
       x: Math.random() * bgW,
-      y: Math.random() * bgH * 0.52,
-      r: Math.random() < 0.85 ? 1 : 1.7,
-      p: Math.random() * Math.PI * 2,
-      tw: 0.001 + Math.random() * 0.003
+      y: Math.random() * bgH,
+      vx: (Math.random() - 0.5) * 6,
+      vy: -4 - Math.random() * 10,
+      s: Math.random() < 0.7 ? 2 : 3
     }));
   }
 
-  function frame(dt, t){
-    const horizon = bgH * 0.58;
-
-    const sky = bgCtx.createLinearGradient(0, 0, 0, horizon);
-    sky.addColorStop(0, '#1a0b32');
-    sky.addColorStop(1, '#3a1152');
-    bgCtx.fillStyle = sky;
-    bgCtx.fillRect(0, 0, bgW, horizon);
-
-    const gnd = bgCtx.createLinearGradient(0, horizon, 0, bgH);
-    gnd.addColorStop(0, '#1a0730');
-    gnd.addColorStop(1, '#0c0418');
-    bgCtx.fillStyle = gnd;
-    bgCtx.fillRect(0, horizon, bgW, bgH - horizon);
-
-    for(const s of stars){
-      const a = 0.25 + 0.6 * Math.abs(Math.sin(s.p + t * s.tw));
-      bgCtx.fillStyle = `rgba(255,233,251,${a.toFixed(3)})`;
-      bgCtx.fillRect(s.x, s.y, s.r, s.r);
+  function click(x, y){
+    const bx = Math.floor(x / CELL) * CELL;
+    const by = Math.floor(y / CELL) * CELL;
+    breaks.push({ x: bx, y: by, t: performance.now() });
+    if(breaks.length > 70) breaks.shift();
+    for(let i = 0; i < 18; i++){
+      parts.push({
+        x: bx + CELL / 2, y: by + CELL / 2,
+        vx: (Math.random() - 0.5) * 190,
+        vy: -Math.random() * 170,
+        s: 2 + Math.random() * 3,
+        life: 1
+      });
     }
-
-    // neon sun
-    const cx = bgW / 2, cy = horizon - 92, rad = 94;
-    bgCtx.save();
-    bgCtx.beginPath();
-    bgCtx.arc(cx, cy, rad, 0, Math.PI * 2);
-    bgCtx.clip();
-    const sg = bgCtx.createLinearGradient(0, cy - rad, 0, cy + rad);
-    sg.addColorStop(0, '#ffd93b');
-    sg.addColorStop(0.5, '#ff5ca8');
-    sg.addColorStop(1, '#ff2d95');
-    bgCtx.fillStyle = sg;
-    bgCtx.fillRect(cx - rad, cy - rad, rad * 2, rad * 2);
-    bgCtx.fillStyle = '#3a1152';
-    for(let i = 0; i < 7; i++){
-      const gy = cy + i * 9 + 4;
-      bgCtx.fillRect(cx - rad, gy, rad * 2, Math.max(2, i * 1.1));
-    }
-    bgCtx.restore();
-
-    // grid floor
-    scroll = (scroll + dt * 0.05) % 44;
-    bgCtx.strokeStyle = 'rgba(0,229,255,0.4)';
-    bgCtx.lineWidth = 1;
-    for(let i = 0; i < 24; i++){
-      const f = i / 24;
-      const y = horizon + (f * f) * (bgH - horizon) + scroll * (0.25 + f);
-      if(y > bgH || y < horizon) continue;
-      bgCtx.globalAlpha = 0.12 + 0.5 * (y - horizon) / (bgH - horizon);
-      bgCtx.beginPath();
-      bgCtx.moveTo(0, y);
-      bgCtx.lineTo(bgW, y);
-      bgCtx.stroke();
-    }
-    bgCtx.globalAlpha = 0.3;
-    const vanish = cx + (mouse.x >= 0 ? (mouse.x - cx) * 0.04 : 0);
-    for(let i = -12; i <= 12; i++){
-      const bx = cx + i * (bgW / 12);
-      bgCtx.beginPath();
-      bgCtx.moveTo(vanish, horizon);
-      bgCtx.lineTo(bx, bgH);
-      bgCtx.stroke();
-    }
-    bgCtx.globalAlpha = 1;
-
-    if(mouse.y > horizon){
-      const g = bgCtx.createRadialGradient(mouse.x, mouse.y, 0, mouse.x, mouse.y, 130);
-      g.addColorStop(0, 'rgba(0,229,255,0.25)');
-      g.addColorStop(1, 'rgba(0,229,255,0)');
-      bgCtx.fillStyle = g;
-      bgCtx.fillRect(mouse.x - 130, mouse.y - 130, 260, 260);
-    }
-
-    bgCtx.fillStyle = 'rgba(0,0,0,0.05)';
-    for(let y = 0; y < bgH; y += 3) bgCtx.fillRect(0, y, bgW, 1);
   }
 
-  return { init, resize: init, frame };
+  function frame(dt, t){
+    if(!field) buildField();
+    const sec = dt / 1000;
+
+    bgCtx.drawImage(field, 0, 0);
+
+    // mined-out blocks, before lighting so the holes stay dark
+    for(let i = breaks.length - 1; i >= 0; i--){
+      const b = breaks[i];
+      if(t - b.t > 6000){ breaks.splice(i, 1); continue; }
+      bgCtx.fillStyle = '#0a0908';
+      bgCtx.fillRect(b.x, b.y, CELL, CELL);
+    }
+
+    // torchlight — multiply a warm radial falloff over the wall
+    flick += dt;
+    const wob = 1 + Math.sin(flick * 0.011) * 0.035 + Math.sin(flick * 0.027) * 0.02;
+    const R = TORCH_R * wob;
+    const lx = mouse.x < 0 ? bgW * 0.5 : mouse.x;
+    const ly = mouse.y < 0 ? bgH * 0.42 : mouse.y;
+    const g = bgCtx.createRadialGradient(lx, ly, 0, lx, ly, R);
+    g.addColorStop(0,    'rgb(255,246,224)');
+    g.addColorStop(0.32, 'rgb(214,178,130)');
+    g.addColorStop(0.66, 'rgb(116,97,74)');
+    g.addColorStop(1,    'rgb(36,32,27)');
+    bgCtx.globalCompositeOperation = 'multiply';
+    bgCtx.fillStyle = g;
+    bgCtx.fillRect(0, 0, bgW, bgH);
+    bgCtx.globalCompositeOperation = 'source-over';
+
+    // cave dust drifting up, brighter inside the torchlight
+    for(const m of motes){
+      m.x += m.vx * sec;
+      m.y += m.vy * sec;
+      if(m.y < -8){ m.y = bgH + 8; m.x = Math.random() * bgW; }
+      if(m.x < -8) m.x = bgW + 8; else if(m.x > bgW + 8) m.x = -8;
+      const lit = Math.max(0.05, 1 - Math.hypot(m.x - lx, m.y - ly) / R);
+      bgCtx.fillStyle = `rgba(255,226,182,${(lit * 0.5).toFixed(3)})`;
+      bgCtx.fillRect(m.x, m.y, m.s, m.s);
+    }
+
+    // block-break debris
+    for(let i = parts.length - 1; i >= 0; i--){
+      const p = parts[i];
+      p.vy += 620 * sec;
+      p.x += p.vx * sec;
+      p.y += p.vy * sec;
+      p.life -= sec * 1.3;
+      if(p.life <= 0){ parts.splice(i, 1); continue; }
+      const lit = Math.max(0.15, 1 - Math.hypot(p.x - lx, p.y - ly) / R);
+      bgCtx.fillStyle = `rgba(${(150 * lit + 40) | 0},${(142 * lit + 38) | 0},${(136 * lit + 34) | 0},${p.life.toFixed(2)})`;
+      bgCtx.fillRect(p.x, p.y, p.s, p.s);
+    }
+  }
+
+  return { init, resize: init, frame, click };
 });
 
-/* ---- paper: ink blots that bloom then dry, droplets trail the cursor ---- */
+/* ---- paper: ink blots that bloom then dry, a droplet trail off the cursor,
+       and a splatter on click ---- */
 Backgrounds.paper = () => makeBg(() => {
+  const DROP_MS = 70;         // how often the cursor sheds a droplet
   let blots = [];
   let lastDrop = 0;
 
-  function makeBlot(x, y, small){
-    const big = !small;
+  function makeBlot(x, y, kind){
+    // kind: 'big' (ambient stain) | 'drop' (cursor trail) | 'splat' (click)
+    const big = kind === 'big';
+    const splat = kind === 'splat';
     return {
       x: x == null ? Math.random() * bgW : x,
       y: y == null ? Math.random() * bgH : y,
-      r: big ? 10 + Math.random() * 22 : 3 + Math.random() * 6,
+      r: big ? 10 + Math.random() * 22 : splat ? 5 + Math.random() * 14 : 2 + Math.random() * 4,
       age: 0,
-      grow: big ? 1400 + Math.random() * 1600 : 600,
-      life: big ? 9000 + Math.random() * 8000 : 3000,
+      grow: big ? 1400 + Math.random() * 1600 : splat ? 380 : 320,
+      life: big ? 9000 + Math.random() * 8000 : splat ? 4200 : 1900,
       seed: Math.random() * 1000,
-      max: big ? 0.5 : 0.34
+      max: big ? 0.5 : splat ? 0.55 : 0.3
     };
   }
 
   function init(){
     blots = Array.from({ length: 7 }, () => {
-      const b = makeBlot();
+      const b = makeBlot(null, null, 'big');
       b.age = Math.random() * b.life;
       return b;
     });
     lastDrop = 0;
+  }
+
+  function click(x, y){
+    blots.push(makeBlot(x, y, 'splat'));
+    const n = 9 + ((Math.random() * 6) | 0);
+    for(let i = 0; i < n; i++){
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 14 + Math.random() * 76;
+      blots.push(makeBlot(x + Math.cos(ang) * dist, y + Math.sin(ang) * dist, 'splat'));
+    }
+    if(blots.length > 160) blots.splice(0, blots.length - 160);
   }
 
   function frame(dt, t){
@@ -1106,9 +1178,12 @@ Backgrounds.paper = () => makeBg(() => {
       bgCtx.stroke();
     }
 
-    if(mouse.x >= 0 && t - lastDrop > 400){
+    // frequent small droplets so the cursor leaves a subtle trail
+    if(mouse.x >= 0 && t - lastDrop > DROP_MS){
       lastDrop = t;
-      blots.push(makeBlot(mouse.x + (Math.random() - 0.5) * 10, mouse.y + (Math.random() - 0.5) * 10, true));
+      blots.push(makeBlot(mouse.x + (Math.random() - 0.5) * 7,
+                          mouse.y + (Math.random() - 0.5) * 7, 'drop'));
+      if(blots.length > 200) blots.shift();
     }
 
     for(let i = blots.length - 1; i >= 0; i--){
@@ -1137,13 +1212,13 @@ Backgrounds.paper = () => makeBg(() => {
       bgCtx.fill();
     }
 
-    if(blots.length < 11 && Math.random() < 0.003) blots.push(makeBlot());
+    if(blots.length < 11 && Math.random() < 0.003) blots.push(makeBlot(null, null, 'big'));
   }
 
-  return { init, resize: init, frame };
+  return { init, resize: init, frame, click };
 });
 
 /* ===================== INIT THEME ===================== */
-let savedTheme = 'stars';
-try { savedTheme = localStorage.getItem('ah-theme') || 'stars'; } catch(e){}
+let savedTheme = 'constellation';
+try { savedTheme = localStorage.getItem('ah-theme') || 'constellation'; } catch(e){}
 applyTheme(savedTheme);

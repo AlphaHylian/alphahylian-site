@@ -11,10 +11,12 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 <script>
-  /* Apply the saved theme before first paint to avoid a flash of the default. */
+  /* Apply the saved theme before first paint to avoid a flash of the default.
+     'stars' and the retired 'synthwave' both fall back to 'constellation'. */
   try {
     var t = localStorage.getItem('ah-theme');
-    if (t && ['stars','terminal','minecraft','synthwave','paper'].indexOf(t) !== -1) {
+    if (t === 'stars' || t === 'synthwave') t = 'constellation';
+    if (t && ['constellation','terminal','minecraft','paper'].indexOf(t) !== -1) {
       document.documentElement.setAttribute('data-theme', t);
     }
   } catch (e) {}
@@ -31,17 +33,14 @@
   </button>
   <div id="theme-menu" role="menu" hidden>
     <p class="theme-menu-title">Site style</p>
-    <button class="theme-option" role="menuitemradio" data-theme="stars" aria-checked="true" type="button">
-      <span class="theme-swatch" data-sw="stars"></span><span>Purple Stars</span>
+    <button class="theme-option" role="menuitemradio" data-theme="constellation" aria-checked="true" type="button">
+      <span class="theme-swatch" data-sw="constellation"></span><span>Constellation</span>
     </button>
     <button class="theme-option" role="menuitemradio" data-theme="terminal" aria-checked="false" type="button">
       <span class="theme-swatch" data-sw="terminal"></span><span>Terminal</span>
     </button>
     <button class="theme-option" role="menuitemradio" data-theme="minecraft" aria-checked="false" type="button">
       <span class="theme-swatch" data-sw="minecraft"></span><span>Minecraft</span>
-    </button>
-    <button class="theme-option" role="menuitemradio" data-theme="synthwave" aria-checked="false" type="button">
-      <span class="theme-swatch" data-sw="synthwave"></span><span>Synthwave</span>
     </button>
     <button class="theme-option" role="menuitemradio" data-theme="paper" aria-checked="false" type="button">
       <span class="theme-swatch" data-sw="paper"></span><span>Paper &amp; Ink</span>
@@ -114,8 +113,11 @@
           </button>
 
           <div class="quote-body">
-            <blockquote id="quote-text">Live, if only for the purpose of spiting death.</blockquote>
-            <cite id="quote-author">alphahylian</cite>
+            <blockquote class="quote-text" id="quote-text">Live, if only for the purpose of spiting death.</blockquote>
+            <cite class="quote-author" id="quote-author">alphahylian</cite>
+            <!-- Purple duplicate of the text above, revealed through a mask that
+                 follows (and trails behind) the cursor. Filled by script.js. -->
+            <div class="quote-paint" id="quote-paint" aria-hidden="true"></div>
           </div>
 
           <button class="quote-arrow next" id="quote-next" aria-label="Next quote">

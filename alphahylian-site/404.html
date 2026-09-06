@@ -13,7 +13,8 @@
 <script>
   try {
     var t = localStorage.getItem('ah-theme');
-    if (t && ['stars','terminal','minecraft','synthwave','paper'].indexOf(t) !== -1) {
+    if (t === 'stars' || t === 'synthwave') t = 'constellation';
+    if (t && ['constellation','terminal','minecraft','paper'].indexOf(t) !== -1) {
       document.documentElement.setAttribute('data-theme', t);
     }
   } catch (e) {}

@@ -110,7 +110,10 @@
   .cd-seg button[aria-pressed=true]{ color:var(--text); border-color:var(--accent); background:var(--accent-deep); }
   html[data-theme=paper] .cd-seg button[aria-pressed=true]{ color:#fff; }
 
-  .cd-check{ display:flex; align-items:center; gap:9px; font-size:12.5px; color:var(--text-dim); cursor:pointer; }
+  .cd-group > label.cd-check{
+    display:flex; align-items:center; justify-content:flex-start; gap:9px;
+    font-size:12.5px; font-weight:500; color:var(--text-dim); cursor:pointer;
+  }
   .cd-check input{ accent-color:var(--accent); width:15px; height:15px; }
 
   .cd-auto{
@@ -256,7 +259,7 @@
             <button type="button" data-v="normal" aria-pressed="true">Normal</button>
             <button type="button" data-v="high">High</button>
           </div>
-          <div class="cd-hint" id="cd-qhint">Draft is roughly twice as fast and noticeably softer.</div>
+          <div class="cd-hint" id="cd-qhint">Higher quality means a bigger file. Speed is about the same either way.</div>
         </div>
       </div>
     </div>
@@ -293,8 +296,9 @@
     </div>
   </div>
 
-  <p class="cd-note">Everything happens locally with ffmpeg compiled to WebAssembly — the video
-    never leaves your computer. Long clips take a while; keep the tab open while it works.</p>
+  <p class="cd-note">Everything happens locally — the video never leaves your computer.
+    MP4 and MOV use your browser&rsquo;s own video encoder and go quickly; other formats fall back
+    to a slower software encoder. Keep the tab open while it works.</p>
 </div>
 
 <!-- served from our own origin: ffmpeg.wasm spawns a Worker, and a Worker

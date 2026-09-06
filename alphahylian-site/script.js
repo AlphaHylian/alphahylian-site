@@ -671,21 +671,41 @@ function triggerPunch(){
   if(!hitAnim) hitAnim = new skinview3d.HitAnimation();
   const anim = viewer.animation;
 
+  // IdleAnimation only writes leftArm.rotation.z, rightArm.rotation.z and
+  // cape.rotation.x each frame. Everything else the swing touches is static, so
+  // it has to be snapshotted HERE, at rest — reading it back inside the
+  // callback would just read the previous frame's blended output and the arm
+  // would converge to wherever it drifted instead of to neutral.
+  const skin0 = viewer.playerObject.skin;
+  const rest = {
+    rax: skin0.rightArm.rotation.x,
+    lax: skin0.leftArm.rotation.x,
+    lpx: skin0.leftArm.position.x,
+    lpz: skin0.leftArm.position.z,
+    by:  skin0.body.rotation.y
+  };
+
+  function restorePose(skin){
+    skin.rightArm.rotation.x = rest.rax;
+    skin.leftArm.rotation.x  = rest.lax;
+    skin.leftArm.position.x  = rest.lpx;
+    skin.leftArm.position.z  = rest.lpz;
+    skin.body.rotation.y     = rest.by;
+  }
+
   punchId = anim.addAnimation((player, progress, id) => {
+    const skin = player.skin;
     if(progress >= HIT_PERIOD){
       anim.removeAnimation(id);
       if(punchId === id) punchId = null;
+      restorePose(skin);            // land exactly back on neutral
       return;
     }
-    const skin = player.skin;
-    // The idle pose for this frame is already applied, so capture it and blend
-    // the swing in and out against it — no snap at either end.
-    const rest = {
-      rax: skin.rightArm.rotation.x, raz: skin.rightArm.rotation.z,
-      lax: skin.leftArm.rotation.x,  laz: skin.leftArm.rotation.z,
-      lpx: skin.leftArm.position.x,  lpz: skin.leftArm.position.z,
-      by:  skin.body.rotation.y
-    };
+
+    // the two z rotations ARE idle-driven, so this frame's value is the true
+    // rest pose for them
+    const restRaz = skin.rightArm.rotation.z;
+    const restLaz = skin.leftArm.rotation.z;
 
     hitAnim.progress = progress * HIT_SPEED;
     hitAnim.animate(player);
@@ -695,9 +715,9 @@ function triggerPunch(){
     const k = e * e * (3 - 2 * e);                    // smoothstep
     const mix = (cur, base) => base + (cur - base) * k;
     skin.rightArm.rotation.x = mix(skin.rightArm.rotation.x, rest.rax);
-    skin.rightArm.rotation.z = mix(skin.rightArm.rotation.z, rest.raz);
+    skin.rightArm.rotation.z = mix(skin.rightArm.rotation.z, restRaz);
     skin.leftArm.rotation.x  = mix(skin.leftArm.rotation.x,  rest.lax);
-    skin.leftArm.rotation.z  = mix(skin.leftArm.rotation.z,  rest.laz);
+    skin.leftArm.rotation.z  = mix(skin.leftArm.rotation.z,  restLaz);
     skin.leftArm.position.x  = mix(skin.leftArm.position.x,  rest.lpx);
     skin.leftArm.position.z  = mix(skin.leftArm.position.z,  rest.lpz);
     skin.body.rotation.y     = mix(skin.body.rotation.y,     rest.by);
@@ -712,6 +732,33 @@ function overflowPast(value, limit){
   return 0;
 }
 
+// Wrap an angle into (-PI, PI] so easing takes the short way round.
+function normalizeAngle(a){
+  a = (a + Math.PI) % (Math.PI * 2);
+  if(a < 0) a += Math.PI * 2;
+  return a - Math.PI;
+}
+
+// Where the cursor wants the model to look, in yaw/pitch.
+function lookTarget(){
+  const rect = skinCanvas.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height * 0.32;
+  const dx = (mouse.x - cx) / (rect.width / 2 || 1);
+  const dy = (mouse.y - cy) / (rect.height / 2 || 1);
+  return {
+    yaw: Math.max(-1.6, Math.min(1.6, dx)) * 0.95,
+    pitch: Math.max(-1.2, Math.min(1.2, dy)) * 0.85 + EYE_PITCH_OFFSET
+  };
+}
+
+// The body angle continuous tracking would settle at for a given look target:
+// zero while the head can cover it alone, otherwise just enough to take up the
+// slack past the soft limit.
+function restingBody(desired){
+  return desired - Math.max(-HEAD_SOFT_LIMIT, Math.min(HEAD_SOFT_LIMIT, desired));
+}
+
 function updateHeadLook(){
   if(!viewer) return;
 
@@ -723,23 +770,30 @@ function updateHeadLook(){
       headYaw += (0 - headYaw) * HEAD_SPEED;
       headPitch += (0 - headPitch) * HEAD_SPEED;
     } else if(lookMode === 'resetting'){
-      bodyYaw += (0 - bodyYaw) * BODY_RESET_SPEED;
-      bodyPitch += (0 - bodyPitch) * BODY_RESET_SPEED;
-      headYaw += (0 - headYaw) * HEAD_SPEED;
-      headPitch += (0 - headPitch) * HEAD_SPEED;
-      if(Math.abs(bodyYaw) < SETTLE_EPSILON && Math.abs(bodyPitch) < SETTLE_EPSILON){
-        bodyYaw = 0; bodyPitch = 0;
+      // Settle straight into the pose that's already looking at the cursor,
+      // taking the shortest way round rather than unwinding the whole spin.
+      const { yaw: desiredYaw, pitch: desiredPitch } = lookTarget();
+      const targetBodyYaw = restingBody(desiredYaw);
+      const targetBodyPitch = restingBody(desiredPitch);
+
+      bodyYaw = targetBodyYaw + normalizeAngle(bodyYaw - targetBodyYaw);
+      bodyPitch = targetBodyPitch + normalizeAngle(bodyPitch - targetBodyPitch);
+      bodyYaw += (targetBodyYaw - bodyYaw) * BODY_RESET_SPEED;
+      bodyPitch += (targetBodyPitch - bodyPitch) * BODY_RESET_SPEED;
+
+      // the head keeps tracking throughout, so it arrives already on target
+      const th = Math.max(-HEAD_HARD_LIMIT, Math.min(HEAD_HARD_LIMIT, desiredYaw - bodyYaw));
+      const tp = Math.max(-HEAD_HARD_LIMIT, Math.min(HEAD_HARD_LIMIT, desiredPitch - bodyPitch));
+      headYaw += (th - headYaw) * HEAD_SPEED;
+      headPitch += (tp - headPitch) * HEAD_SPEED;
+
+      if(Math.abs(bodyYaw - targetBodyYaw) < SETTLE_EPSILON &&
+         Math.abs(bodyPitch - targetBodyPitch) < SETTLE_EPSILON){
+        bodyYaw = targetBodyYaw; bodyPitch = targetBodyPitch;
         lookMode = 'tracking';
       }
     } else {
-      const rect = skinCanvas.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height * 0.32;
-      const dx = (mouse.x - cx) / (rect.width / 2 || 1);
-      const dy = (mouse.y - cy) / (rect.height / 2 || 1);
-
-      const desiredYaw = Math.max(-1.6, Math.min(1.6, dx)) * 0.95;
-      const desiredPitch = Math.max(-1.2, Math.min(1.2, dy)) * 0.85 + EYE_PITCH_OFFSET;
+      const { yaw: desiredYaw, pitch: desiredPitch } = lookTarget();
 
       const overflowYaw = overflowPast(desiredYaw - bodyYaw, HEAD_SOFT_LIMIT);
       const overflowPitch = overflowPast(desiredPitch - bodyPitch, HEAD_SOFT_LIMIT);
@@ -791,7 +845,10 @@ function makeBg(build){
       const loop = now => {
         if(!running) return;
         const dt = Math.min(50, now - last); last = now;
-        api.frame(dt, now);
+        // A throw inside a rAF callback kills the loop permanently, freezing
+        // the background mid-frame. Never let one bad frame do that.
+        try { api.frame(dt, now); }
+        catch(err){ console.warn('background frame failed:', err); }
         raf = requestAnimationFrame(loop);
       };
       raf = requestAnimationFrame(loop);
@@ -911,7 +968,10 @@ Backgrounds.constellation = () => makeBg(() => {
       }
 
       for(const w of waves){
-        const age = (t - w.t) / WAVE_MS;
+        // The rAF timestamp is the frame's start, which can predate the
+        // performance.now() taken while handling the click — so clamp, or the
+        // ring radius below goes negative and arc() throws.
+        const age = Math.max(0, (t - w.t) / WAVE_MS);
         const ring = age * WAVE_SPEED;
         const wx = p.x - w.x, wy = p.y - w.y;
         const d = Math.hypot(wx, wy);
@@ -946,11 +1006,11 @@ Backgrounds.constellation = () => makeBg(() => {
 
     // barely-there expanding ring so the ripple still reads in sparse areas
     for(const w of waves){
-      const age = (t - w.t) / WAVE_MS;
+      const age = Math.max(0, (t - w.t) / WAVE_MS);
       bgCtx.strokeStyle = `rgba(168,136,255,${(0.1 * (1 - age)).toFixed(3)})`;
       bgCtx.lineWidth = 1;
       bgCtx.beginPath();
-      bgCtx.arc(w.x, w.y, age * WAVE_SPEED, 0, Math.PI * 2);
+      bgCtx.arc(w.x, w.y, Math.max(0, age * WAVE_SPEED), 0, Math.PI * 2);
       bgCtx.stroke();
     }
 
@@ -1231,7 +1291,8 @@ Backgrounds.minecraft = () => makeBg(() => {
 /* ---- paper: ambient stains that bloom then dry, a connected ink trail off
        the cursor, and an ink bloom that wicks into the paper on click ---- */
 Backgrounds.paper = () => makeBg(() => {
-  const DROP_MS = 90;          // how often the trail sheds a droplet
+  const DROP_MS = 280;         // the trail carries the motion, so drops are
+                               // fewer and fatter than before
   const TRAIL_MS = 2600;       // how long the trail stays wet
   const TRAIL_STEP = 5;        // px between recorded trail points
   const MAX_TRAIL = 260;
@@ -1244,12 +1305,12 @@ Backgrounds.paper = () => makeBg(() => {
     return {
       x: x == null ? Math.random() * bgW : x,
       y: y == null ? Math.random() * bgH : y,
-      r: big ? 10 + Math.random() * 22 : 2 + Math.random() * 3.5,
+      r: big ? 10 + Math.random() * 22 : 5 + Math.random() * 7,
       age: 0,
-      grow: big ? 1400 + Math.random() * 1600 : 300,
+      grow: big ? 1400 + Math.random() * 1600 : 420,
       life: big ? 9000 + Math.random() * 8000 : TRAIL_MS,
       seed: Math.random() * 1000,
-      max: big ? 0.5 : 0.34
+      max: big ? 0.5 : 0.4
     };
   }
 
@@ -1264,18 +1325,33 @@ Backgrounds.paper = () => makeBg(() => {
     lastDrop = 0;
   }
 
-  // Click = a single drop of ink landing and wicking outward through the paper
-  // fibres: one soft stain that swells fast, then dries to a pale mark.
-  const BLOOM_MS = 5200;
+  // Click = a drop of ink hitting the page: a stain that swells and wicks into
+  // the fibres, irregular lobes creeping off its edge, a soft halo bleeding
+  // past that, and a scatter of flung satellite droplets. All the randomness is
+  // baked in here so the shape is stable while it grows and dries.
+  const BLOOM_MS = 7000;
   function click(x, y){
+    const maxR = 32 + Math.random() * 20;
     blooms.push({
       x, y,
       t: performance.now(),
-      max: 46 + Math.random() * 26,
+      maxR,
       seed: Math.random() * 1000,
-      spikes: 7 + ((Math.random() * 5) | 0)
+      lobes: Array.from({ length: 6 + ((Math.random() * 4) | 0) }, () => ({
+        a: Math.random() * Math.PI * 2,
+        d: 0.85 + Math.random() * 0.5,      // × r from the centre
+        s: 0.16 + Math.random() * 0.2,      // × r
+        seed: Math.random() * 1000
+      })),
+      sats: Array.from({ length: 5 + ((Math.random() * 5) | 0) }, () => ({
+        a: Math.random() * Math.PI * 2,
+        d: 1.7 + Math.random() * 1.6,       // × maxR
+        s: 0.05 + Math.random() * 0.1,
+        seed: Math.random() * 1000,
+        delay: Math.random() * 90
+      }))
     });
-    if(blooms.length > 14) blooms.shift();
+    if(blooms.length > 12) blooms.shift();
   }
 
   function inkBlobPath(x, y, r, seed, wobA, wobB){
@@ -1356,29 +1432,49 @@ Backgrounds.paper = () => makeBg(() => {
     /* --- click blooms --- */
     for(let i = blooms.length - 1; i >= 0; i--){
       const b = blooms[i];
-      const age = (t - b.t) / BLOOM_MS;
+      const age = Math.max(0, (t - b.t) / BLOOM_MS);
       if(age >= 1){ blooms.splice(i, 1); continue; }
-      // swells quickly, then creeps
-      const grow = 1 - Math.exp(-age * 7);
-      const r = b.max * (0.18 + 0.82 * grow);
-      const wet = Math.max(0, 1 - age * 3.2);
-      const alpha = 0.14 + 0.4 * wet;
 
-      // fine tendrils wicking along the paper fibres
-      bgCtx.strokeStyle = `rgba(52,38,24,${(alpha * 0.55).toFixed(3)})`;
-      bgCtx.lineWidth = 1.1;
-      for(let s = 0; s < b.spikes; s++){
-        const ang = (s / b.spikes) * Math.PI * 2 + b.seed;
-        const len = r * (1.05 + 0.5 * Math.abs(Math.sin(b.seed + s * 2.7)));
-        bgCtx.beginPath();
-        bgCtx.moveTo(b.x + Math.cos(ang) * r * 0.7, b.y + Math.sin(ang) * r * 0.7);
-        bgCtx.lineTo(b.x + Math.cos(ang) * len, b.y + Math.sin(ang) * len);
-        bgCtx.stroke();
+      // swells fast on impact, then creeps outward much more slowly
+      const grow = 1 - Math.pow(1 - Math.min(1, age * 5), 3);
+      const r = b.maxR * (0.28 + 0.72 * grow);
+      const wet = Math.max(0, 1 - age * 2.4);
+      const fade = age > 0.6 ? 1 - (age - 0.6) / 0.4 : 1;
+      // wet ink is near-black; as it dries it lightens to a sepia stain
+      const ink = a => `rgba(${(26 + 68 * (1 - wet)) | 0},${(17 + 54 * (1 - wet)) | 0},${(10 + 40 * (1 - wet)) | 0},${a.toFixed(3)})`;
+
+      // soft halo bleeding past the edge, drawn as a few widening ghosts
+      for(let h = 3; h >= 1; h--){
+        inkBlobPath(b.x, b.y, r * (1 + h * 0.17), b.seed + h * 13, 0.14, 0.07);
+        bgCtx.fillStyle = ink(0.055 * fade);
+        bgCtx.fill();
       }
 
-      inkBlobPath(b.x, b.y, r, b.seed, 0.16, 0.09);
-      bgCtx.fillStyle = `rgba(${(40 + 56 * (1 - wet)) | 0},${(28 + 44 * (1 - wet)) | 0},${(18 + 32 * (1 - wet)) | 0},${alpha.toFixed(3)})`;
+      // irregular lobes creeping off the rim
+      for(const l of b.lobes){
+        inkBlobPath(b.x + Math.cos(l.a) * r * l.d,
+                    b.y + Math.sin(l.a) * r * l.d,
+                    Math.max(2, r * l.s * (0.45 + 0.55 * grow)), l.seed, 0.17, 0.08);
+        bgCtx.fillStyle = ink(0.4 * fade);
+        bgCtx.fill();
+      }
+
+      // the main stain
+      inkBlobPath(b.x, b.y, r, b.seed, 0.13, 0.07);
+      bgCtx.fillStyle = ink((0.44 + 0.34 * wet) * fade);
       bgCtx.fill();
+
+      // droplets flung clear of the impact — keep the wobble low, a few px of
+      // radius with a strong wobble makes the polygon self-intersect and the
+      // droplet comes out an angular splinter instead of a blob
+      for(const s of b.sats){
+        if(t - b.t < s.delay) continue;
+        inkBlobPath(b.x + Math.cos(s.a) * b.maxR * s.d,
+                    b.y + Math.sin(s.a) * b.maxR * s.d,
+                    Math.max(1.8, b.maxR * s.s), s.seed, 0.11, 0.05);
+        bgCtx.fillStyle = ink(0.36 * fade);
+        bgCtx.fill();
+      }
     }
 
     if(blots.length < 11 && Math.random() < 0.003) blots.push(makeBlot(null, null, true));

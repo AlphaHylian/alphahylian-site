@@ -5,7 +5,10 @@
    been broken and how damaged the rest are.
    ===================================================================== */
 
-const COLS = 16;
+// Fixed for the session: the world is generated from the column index, so
+// changing this mid-game (on an orientation flip) would reshuffle the terrain.
+// Phones get a narrower shaft so the blocks stay thumb-sized.
+const COLS = window.innerWidth < 760 ? 10 : 16;
 const MINE_INTERVAL = 120;      // ms between swings while holding
 const CRACK_STAGES = 4;
 

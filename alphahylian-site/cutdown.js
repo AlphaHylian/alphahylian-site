@@ -69,6 +69,7 @@ const errEl = el('cd-err');
 const autoEl = el('cd-auto');
 const autoNoteEl = el('cd-autonote');
 const previewEl = el('cd-preview');
+const engineEl = el('cd-engine');
 
 const ctrl = {
   thr: el('cd-thr'), thrV: el('cd-thr-v'),
@@ -473,32 +474,15 @@ function buildFilterGraph(keep, levelKey, wantLufs) {
   return { graph: parts.join(';'), audioLabel: chain.length ? '[aout]' : '[araw]' };
 }
 
-async function process() {
-  if (state.busy || !state.file || !state.keep.length) return;
-  state.busy = true;
-  goEl.disabled = true;
-  clearError();
-  resultEl.classList.remove('on');
-  progEl.classList.add('on');
-  barEl.style.width = '0%';
+/** ffmpeg fallback: one pass, trim+concat+level, re-encoding with libx264. */
+async function processWithFFmpeg(onProgress) {
+  const { graph, audioLabel } = buildFilterGraph(state.keep, state.level, ctrl.lufs.checked);
+  const q = QUALITY[state.quality];
+  const inName = 'input.' + state.ext;
 
-  const targetOut = keptDuration(state.keep);
-  plabelEl.textContent = 'Cutting and encoding…';
-
-  const onProgress = ({ progress }) => {
-    // progress is a fraction of the expected output duration; it can overshoot
-    // slightly on filter graphs, so clamp it.
-    const p = Math.max(0, Math.min(1, progress || 0));
-    barEl.style.width = (p * 100).toFixed(1) + '%';
-    plabelEl.textContent = `Cutting and encoding… ${Math.round(p * 100)}%`;
-  };
-  ffmpeg.on('progress', onProgress);
-
+  const relay = ({ progress }) => onProgress(Math.max(0, Math.min(1, progress || 0)), 'Encoding…');
+  ffmpeg.on('progress', relay);
   try {
-    const { graph, audioLabel } = buildFilterGraph(state.keep, state.level, ctrl.lufs.checked);
-    const q = QUALITY[state.quality];
-    const inName = 'input.' + state.ext;
-
     await ffmpeg.exec([
       '-i', inName,
       '-filter_complex', graph,
@@ -508,21 +492,73 @@ async function process() {
       '-movflags', '+faststart',
       'output.mp4'
     ]);
-
     const out = await ffmpeg.readFile('output.mp4');
     if (!out || !out.length) throw new Error('ffmpeg produced an empty file');
-
     const blob = new Blob([out.buffer], { type: 'video/mp4' });
+    await ffmpeg.deleteFile('output.mp4');
+    return blob;
+  } finally {
+    if (ffmpeg.off) ffmpeg.off('progress', relay);
+  }
+}
+
+async function process() {
+  if (state.busy || !state.file || !state.keep.length) return;
+  state.busy = true;
+  goEl.disabled = true;
+  clearError();
+  setPreview(false);
+  resultEl.classList.remove('on');
+  progEl.classList.add('on');
+  barEl.style.width = '0%';
+
+  const onProgress = (p, label) => {
+    barEl.style.width = (Math.max(0, Math.min(1, p)) * 100).toFixed(1) + '%';
+    plabelEl.textContent = `${label} ${Math.round(p * 100)}%`;
+  };
+
+  const started = performance.now();
+  let blob = null, engine = '';
+
+  // The fast path needs an MP4/MOV the browser can decode; everything else
+  // (MKV, WebM, exotic codecs) goes to ffmpeg.
+  const fastEligible = webCodecsAvailable() && /^(mp4|m4v|mov)$/i.test(state.ext);
+
+  try {
+    if (fastEligible) {
+      try {
+        engineEl.textContent = 'Using the browser’s own video encoder';
+        const r = await processFast(onProgress);
+        blob = r.blob;
+        engine = `browser encoder · ${r.stats.decoded} frames read, ${r.stats.encoded} kept`;
+      } catch (err) {
+        console.warn('[cutdown] fast path unavailable, falling back to ffmpeg:', err);
+        engineEl.textContent = 'Browser encoder could not handle this file (' +
+          (err && err.message ? err.message : err) + ') — using ffmpeg, which is slower.';
+        blob = null;
+      }
+    } else if (!webCodecsAvailable()) {
+      engineEl.textContent = 'This browser has no video encoder API — using ffmpeg, which is slower.';
+    } else {
+      engineEl.textContent = 'That container needs ffmpeg, which is slower. MP4 or MOV is much faster.';
+    }
+
+    if (!blob) {
+      blob = await processWithFFmpeg(onProgress);
+      engine = engine || 'ffmpeg.wasm';
+    }
+
     if (state.outUrl) URL.revokeObjectURL(state.outUrl);
     state.outUrl = URL.createObjectURL(blob);
-
     outEl.src = state.outUrl;
     downloadEl.href = state.outUrl;
     const base = state.file.name.replace(/\.[^.]+$/, '');
     downloadEl.download = `${base} (cutdown).mp4`;
-    outinfoEl.textContent = `${fmtTime(targetOut)} · ${fmtSize(blob.size)}`;
+    const secs = (performance.now() - started) / 1000;
+    outinfoEl.textContent =
+      `${fmtTime(keptDuration(state.keep))} · ${fmtSize(blob.size)} · took ${fmtTime(secs)}`;
+    engineEl.textContent = engine;
 
-    await ffmpeg.deleteFile('output.mp4');
     resultEl.classList.add('on');
     progEl.classList.remove('on');
     resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -532,7 +568,6 @@ async function process() {
     showError('Encoding failed: ' + (err && err.message ? err.message : err) +
       ' — a shorter clip or Draft quality usually gets through.');
   } finally {
-    ffmpeg.off && ffmpeg.off('progress', onProgress);
     state.busy = false;
     goEl.disabled = false;
   }
@@ -676,3 +711,247 @@ window.addEventListener('resize', drawWave);
 
 /* expose the pure analysis for the headless test harness */
 window.__cutdown = { findKeep, computeFrameDb, buildFilterGraph, state, HOP_SECONDS };
+
+/* =====================================================================
+   FAST PATH — WebCodecs
+   ffmpeg.wasm encodes H.264 at roughly 1.5 fps, which makes a long
+   recording hopeless (a 2 h 60 fps video would be days). Browsers ship a
+   hardware video encoder; driving it directly measured ~646 fps end to
+   end on the same clip, so this is the default whenever the input is an
+   MP4/MOV the browser can decode. Anything else falls back to ffmpeg.
+   Video goes demux -> decode -> drop cut frames -> encode -> mux; the
+   audio still goes through ffmpeg, because the levelling filters are the
+   measured ones and audio-only ffmpeg is cheap.
+   ===================================================================== */
+
+// Bits per pixel per frame — resolution and frame rate then set the bitrate.
+const BPP = { draft: 0.06, normal: 0.10, high: 0.16 };
+
+function webCodecsAvailable() {
+  return typeof VideoEncoder !== 'undefined' && typeof VideoDecoder !== 'undefined' &&
+         typeof AudioEncoder !== 'undefined' && typeof window.MP4Box !== 'undefined' &&
+         typeof window.Mp4Muxer !== 'undefined';
+}
+
+/** How much time has been cut away before each keep-range starts. */
+function cumulativeOffsets(keep) {
+  const offsets = new Float64Array(keep.length);
+  offsets[0] = keep[0][0];
+  for (let i = 1; i < keep.length; i++) {
+    offsets[i] = offsets[i - 1] + (keep[i][0] - keep[i - 1][1]);
+  }
+  return offsets;
+}
+
+/** Which keep-range covers time t (seconds), or -1. Ranges are sorted. */
+function keepIndexAt(keep, t) {
+  let lo = 0, hi = keep.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (t < keep[mid][0]) hi = mid - 1;
+    else if (t >= keep[mid][1]) lo = mid + 1;
+    else return mid;
+  }
+  return -1;
+}
+
+// The decoder wants the avcC/hvcC payload as `description`.
+function codecDescription(trak) {
+  const DS = window.DataStream || window.MP4Box.DataStream;
+  for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+    const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+    if (!box) continue;
+    const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
+    box.write(stream);
+    return new Uint8Array(stream.buffer, 8);   // strip the box header
+  }
+  return null;
+}
+
+function demuxVideo(file) {
+  return new Promise((resolve, reject) => {
+    const mp4 = window.MP4Box.createFile();
+    const samples = [];
+    let info = null, description = null, expected = 0, settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (!info) reject(new Error('no video track found'));
+      else resolve({ info, samples, description, track: info.videoTracks[0] });
+    };
+
+    mp4.onError = e => { if (!settled) { settled = true; reject(new Error('demux: ' + e)); } };
+    mp4.onReady = i => {
+      info = i;
+      if (!i.videoTracks || !i.videoTracks.length) return finish();
+      const vt = i.videoTracks[0];
+      expected = vt.nb_samples;
+      description = codecDescription(mp4.getTrackById(vt.id));
+      mp4.setExtractionOptions(vt.id, null, { nbSamples: 5000 });
+      mp4.start();
+    };
+    mp4.onSamples = (id, user, s) => {
+      for (const sample of s) samples.push(sample);
+      if (samples.length >= expected) finish();
+    };
+
+    file.arrayBuffer().then(buf => {
+      buf.fileStart = 0;
+      mp4.appendBuffer(buf);
+      mp4.flush();
+      // flush is synchronous for a complete file; this catches a truncated one
+      setTimeout(finish, 250);
+    }).catch(reject);
+  });
+}
+
+/** Cut + level the audio with ffmpeg (audio only, so it's quick) -> AudioBuffer. */
+async function buildAudioTrack(keep, levelKey, wantLufs, inName) {
+  const parts = [];
+  keep.forEach(([s, e], i) => {
+    parts.push(`[0:a]atrim=${s.toFixed(3)}:${e.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
+  });
+  parts.push(`${keep.map((_, i) => `[a${i}]`).join('')}concat=n=${keep.length}:v=0:a=1[araw]`);
+  const chain = [];
+  if (LEVELS[levelKey]) chain.push(LEVELS[levelKey]);
+  if (wantLufs) chain.push(LOUDNORM);
+  if (chain.length) parts.push(`[araw]${chain.join(',')}[aout]`);
+
+  await ffmpeg.exec([
+    '-i', inName,
+    '-filter_complex', parts.join(';'),
+    '-map', chain.length ? '[aout]' : '[araw]',
+    '-ac', '2', '-ar', '48000', '-c:a', 'pcm_s16le', 'cut.wav'
+  ]);
+  const wav = await ffmpeg.readFile('cut.wav');
+  const actx = new (window.AudioContext || window.webkitAudioContext)();
+  const audio = await actx.decodeAudioData(wav.buffer.slice(0));
+  actx.close();
+  await ffmpeg.deleteFile('cut.wav');
+  return audio;
+}
+
+async function processFast(onProgress) {
+  const keep = state.keep;
+  const offsets = cumulativeOffsets(keep);
+  const inName = 'input.' + state.ext;
+
+  onProgress(0.02, 'Reading the video…');
+  const { track, samples, description } = await demuxVideo(state.file);
+  if (!samples.length) throw new Error('no video samples');
+
+  const width = track.video.width, height = track.video.height;
+  const fps = track.nb_samples / (track.duration / track.timescale) || 30;
+  const bitrate = Math.round(BPP[state.quality] * width * height * Math.min(fps, 60));
+
+  const encCfg = {
+    codec: width * height > 1280 * 720 ? 'avc1.4d0033' : 'avc1.4d001f',
+    width, height, bitrate, framerate: Math.round(fps), avc: { format: 'avc' }
+  };
+  if (!(await VideoEncoder.isConfigSupported(encCfg)).supported) {
+    throw new Error('no supported H.264 encoder config');
+  }
+  const decCfg = { codec: track.codec, codedWidth: width, codedHeight: height };
+  if (description) decCfg.description = description;
+  if (!(await VideoDecoder.isConfigSupported(decCfg)).supported) {
+    throw new Error('browser cannot decode ' + track.codec);
+  }
+
+  onProgress(0.05, 'Levelling the audio…');
+  const audio = await buildAudioTrack(keep, state.level, ctrl.lufs.checked, inName);
+
+  const muxer = new window.Mp4Muxer.Muxer({
+    target: new window.Mp4Muxer.ArrayBufferTarget(),
+    video: { codec: 'avc', width, height },
+    audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: Math.min(2, audio.numberOfChannels) },
+    fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset'
+  });
+
+  // ---- video ----
+  let encoded = 0, decoded = 0, lastIdx = -1;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => { encoded++; muxer.addVideoChunk(chunk, meta); },
+    error: e => { throw e; }
+  });
+  encoder.configure(encCfg);
+
+  const decoder = new VideoDecoder({
+    output: frame => {
+      decoded++;
+      const t = frame.timestamp / 1e6;
+      const idx = keepIndexAt(keep, t);
+      if (idx < 0) { frame.close(); return; }
+      const shifted = new VideoFrame(frame, { timestamp: Math.max(0, Math.round((t - offsets[idx]) * 1e6)) });
+      frame.close();
+      // a keyframe at every splice, so each surviving section starts clean
+      encoder.encode(shifted, { keyFrame: idx !== lastIdx });
+      lastIdx = idx;
+      shifted.close();
+    },
+    error: e => { throw e; }
+  });
+  decoder.configure(decCfg);
+
+  const total = samples.length;
+  for (let i = 0; i < total; i++) {
+    const s = samples[i];
+    decoder.decode(new EncodedVideoChunk({
+      type: s.is_sync ? 'key' : 'delta',
+      timestamp: (s.cts / s.timescale) * 1e6,
+      duration: (s.duration / s.timescale) * 1e6,
+      data: s.data
+    }));
+    // keep the queues bounded or a long video eats all the memory
+    if (decoder.decodeQueueSize > 24 || encoder.encodeQueueSize > 24) {
+      await new Promise(r => setTimeout(r, 0));
+      while (decoder.decodeQueueSize > 12 || encoder.encodeQueueSize > 12) {
+        await new Promise(r => setTimeout(r, 4));
+      }
+    }
+    if ((i & 63) === 0) onProgress(0.08 + 0.82 * (i / total), 'Cutting video…');
+  }
+  await decoder.flush();
+  await encoder.flush();
+  decoder.close();
+  encoder.close();
+
+  // ---- audio ----
+  onProgress(0.92, 'Encoding audio…');
+  const channels = Math.min(2, audio.numberOfChannels);
+  const aacCfg = { codec: 'mp4a.40.2', sampleRate: audio.sampleRate, numberOfChannels: channels, bitrate: 160000 };
+  if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) {
+    throw new Error('no AAC encoder');
+  }
+  const aEnc = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: e => { throw e; }
+  });
+  aEnc.configure(aacCfg);
+
+  const FRAME = 1024;
+  const inter = new Float32Array(FRAME * channels);
+  const chData = [];
+  for (let c = 0; c < channels; c++) chData.push(audio.getChannelData(c));
+  for (let off = 0; off < audio.length; off += FRAME) {
+    const n = Math.min(FRAME, audio.length - off);
+    for (let i = 0; i < n; i++) {
+      for (let c = 0; c < channels; c++) inter[i * channels + c] = chData[c][off + i];
+    }
+    aEnc.encode(new AudioData({
+      format: 'f32', sampleRate: audio.sampleRate, numberOfFrames: n,
+      numberOfChannels: channels, timestamp: Math.round((off / audio.sampleRate) * 1e6),
+      data: inter.subarray(0, n * channels)
+    }));
+    if (aEnc.encodeQueueSize > 32) await new Promise(r => setTimeout(r, 0));
+  }
+  await aEnc.flush();
+  aEnc.close();
+
+  muxer.finalize();
+  onProgress(1, 'Done');
+  return {
+    blob: new Blob([muxer.target.buffer], { type: 'video/mp4' }),
+    stats: { decoded, encoded, fps }
+  };
+}

@@ -846,41 +846,80 @@ function codecDescription(trak) {
   return null;
 }
 
-function demuxVideo(file) {
-  return new Promise((resolve, reject) => {
-    const mp4 = window.MP4Box.createFile();
-    const samples = [];
-    let info = null, description = null, expected = 0, settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (!info) reject(new Error('no video track found'));
-      else resolve({ info, samples, description, track: info.videoTracks[0] });
+/* Streaming demuxer.
+
+   The obvious version reads the whole file into an ArrayBuffer and keeps every
+   sample in an array — which is two full copies of a recording that can be
+   tens of gigabytes. Instead we feed mp4box the file a slice at a time and
+   hand each sample to the decoder as it appears, releasing it straight after.
+   mp4box tells us which byte it wants next, so a file with its moov at the end
+   (anything not written with faststart) jumps there instead of buffering the
+   whole mdat on the way. */
+
+const DEMUX_CHUNK = 8 * 1024 * 1024;
+
+async function openDemuxer(file) {
+  const mp4 = window.MP4Box.createFile();
+  let info = null, failed = null;
+  mp4.onError = e => { failed = new Error('demux: ' + e); };
+  mp4.onReady = i => { info = i; };
+
+  // Append until the moov turns up. appendBuffer returns the offset it wants
+  // next, which is how a moov-at-the-end file gets found in two reads.
+  let next = 0;
+  while (info === null && next < file.size) {
+    const start = next;
+    const buf = await file.slice(start, Math.min(file.size, start + DEMUX_CHUNK)).arrayBuffer();
+    buf.fileStart = start;
+    const want = mp4.appendBuffer(buf);
+    if (failed) throw failed;
+    next = (typeof want === 'number' && want > start) ? want : start + DEMUX_CHUNK;
+  }
+  if (!info) throw new Error('no moov box — not a readable MP4');
+  if (!info.videoTracks || !info.videoTracks.length) throw new Error('no video track found');
+
+  const track = info.videoTracks[0];
+  const description = codecDescription(mp4.getTrackById(track.id));
+
+  /** Pull every sample through `onSample`; it may return a promise to push back. */
+  async function stream(onSample) {
+    let pending = [];
+    mp4.onSamples = (id, user, samples) => {
+      for (const sample of samples) pending.push(sample);
+    };
+    mp4.setExtractionOptions(track.id, null, { nbSamples: 200 });
+    mp4.start();
+
+    const drain = async () => {
+      while (pending.length) {
+        const batch = pending;
+        pending = [];
+        for (const sample of batch) await onSample(sample);
+        // Only now: releaseUsedSamples nulls out sample.data, so calling it any
+        // earlier hands the decoder an empty chunk.
+        mp4.releaseUsedSamples(track.id, batch[batch.length - 1].number);
+        for (const sample of batch) sample.data = null;
+      }
     };
 
-    mp4.onError = e => { if (!settled) { settled = true; reject(new Error('demux: ' + e)); } };
-    mp4.onReady = i => {
-      info = i;
-      if (!i.videoTracks || !i.videoTracks.length) return finish();
-      const vt = i.videoTracks[0];
-      expected = vt.nb_samples;
-      description = codecDescription(mp4.getTrackById(vt.id));
-      mp4.setExtractionOptions(vt.id, null, { nbSamples: 5000 });
-      mp4.start();
-    };
-    mp4.onSamples = (id, user, s) => {
-      for (const sample of s) samples.push(sample);
-      if (samples.length >= expected) finish();
-    };
+    // Whatever was already buffered during the search for the moov has
+    // produced samples; take those before reading any more of the file.
+    await drain();
 
-    file.arrayBuffer().then(buf => {
-      buf.fileStart = 0;
-      mp4.appendBuffer(buf);
-      mp4.flush();
-      // flush is synchronous for a complete file; this catches a truncated one
-      setTimeout(finish, 250);
-    }).catch(reject);
-  });
+    let pos = 0;
+    while (pos < file.size) {
+      const buf = await file.slice(pos, Math.min(file.size, pos + DEMUX_CHUNK)).arrayBuffer();
+      buf.fileStart = pos;
+      const want = mp4.appendBuffer(buf);
+      if (failed) throw failed;
+      await drain();
+      pos = (typeof want === 'number' && want > pos) ? want : pos + DEMUX_CHUNK;
+    }
+    mp4.flush();
+    await drain();
+  }
+
+  return { track, description, stream, total: track.nb_samples };
 }
 
 /** Cut + level the audio with ffmpeg (audio only, so it's quick) -> AudioBuffer. */
@@ -915,8 +954,9 @@ async function processFast(onProgress, sink) {
   const inName = 'input.' + state.ext;
 
   onProgress(0.02, 'Reading the video…');
-  const { track, samples, description } = await demuxVideo(state.file);
-  if (!samples.length) throw new Error('no video samples');
+  const dm = await openDemuxer(state.file);
+  const { track, description } = dm;
+  if (!dm.total) throw new Error('no video samples');
 
   const width = track.video.width, height = track.video.height;
   const fps = track.nb_samples / (track.duration / track.timescale) || 30;
@@ -978,9 +1018,9 @@ async function processFast(onProgress, sink) {
   });
   decoder.configure(decCfg);
 
-  const total = samples.length;
-  for (let i = 0; i < total; i++) {
-    const s = samples[i];
+  const total = dm.total;
+  let read = 0;
+  await dm.stream(async s => {
     decoder.decode(new EncodedVideoChunk({
       type: s.is_sync ? 'key' : 'delta',
       timestamp: (s.cts / s.timescale) * 1e6,
@@ -994,8 +1034,9 @@ async function processFast(onProgress, sink) {
         await new Promise(r => setTimeout(r, 4));
       }
     }
-    if ((i & 63) === 0) onProgress(0.08 + 0.82 * (i / total), 'Cutting video…');
-  }
+    if ((read & 63) === 0) onProgress(0.08 + 0.82 * (read / total), 'Cutting video…');
+    read++;
+  });
   await decoder.flush();
   await encoder.flush();
   decoder.close();

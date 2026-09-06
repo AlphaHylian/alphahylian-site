@@ -1,0 +1,20 @@
+{
+	"schemaVersion": 1,
+	"id": "skirmish",
+	"version": "${version}",
+	"name": "Skirmish",
+	"description": "A PvP heads-up display: keystrokes, CPS, armour durability, effects and combo tracking. Read-only — it shows you what your own client already knows.",
+	"authors": ["AlphaHylian"],
+	"contact": {},
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.alphahylian.skirmish.SkirmishClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

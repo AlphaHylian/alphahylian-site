@@ -147,6 +147,15 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m9 5 7 7-7 7"/></svg>
             </span>
           </a>
+          <a class="hl hl-play" href="/cutdown.html">
+            <span class="hl-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 12h2m3 0h1m3 0h1m3 0h2"/><path d="M7 8v8M11 5v14M15 7v10M19 10v4"/></svg>
+            </span>
+            <span class="hl-text"><b>Cutdown</b><i>Cut silence &amp; level audio</i></span>
+            <span class="hl-go" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m9 5 7 7-7 7"/></svg>
+            </span>
+          </a>
           <a class="hl" href="https://youtube.com/@alphahylian" target="_blank" rel="noopener">
             <span class="hl-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
@@ -226,6 +235,33 @@
             <div class="proj-links">
               <a class="proj-link" href="https://github.com/AlphaHylian/alphahylian-site" target="_blank" rel="noopener">
                 Source on GitHub
+              </a>
+            </div>
+          </div>
+        </article>
+
+        <article class="proj proj-feature">
+          <div class="proj-art proj-art-cut" aria-hidden="true">
+            <span class="bl b1"></span><span class="bl b2"></span><span class="bl b3"></span>
+            <span class="bl b4"></span><span class="bl b5"></span><span class="bl b6"></span>
+            <span class="bl b7"></span><span class="bl b8"></span><span class="bl b9"></span>
+            <span class="gap g1"></span><span class="gap g2"></span>
+          </div>
+          <div class="proj-body">
+            <span class="proj-tag">Runs in your browser</span>
+            <h2 class="proj-title">Cutdown</h2>
+            <p class="proj-desc">Drop in a video and it finds every gap where you aren&rsquo;t
+              talking, cuts them out, and evens the volume so a whisper and a shout land at the
+              same level. On a test clip it pulled a 16.5&nbsp;dB gap between quiet and loud
+              passages down to 1.3&nbsp;dB. ffmpeg compiled to WebAssembly does the work
+              locally &mdash; the video never leaves your computer.</p>
+            <ul class="proj-tech">
+              <li>ffmpeg.wasm</li><li>Web Audio</li><li>No upload</li>
+            </ul>
+            <div class="proj-links">
+              <a class="proj-cta" href="/cutdown.html">
+                Open it
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m9 5 7 7-7 7"/></svg>
               </a>
             </div>
           </div>

@@ -857,6 +857,29 @@ html[data-theme="paper"] .hl-icon{ color: #fff; }
   background: linear-gradient(140deg, var(--accent), var(--accent-deep));
 }
 
+/* cutdown artwork: a waveform with two chunks cut out of it */
+.proj-art-cut{ background:#141419; overflow:hidden; }
+.proj-art-cut .bl{
+  position:absolute; bottom:50%; width:7px; border-radius:3px;
+  background:var(--accent); transform:translateY(50%);
+}
+.proj-art-cut .b1{ left:8%;  height:38px; }
+.proj-art-cut .b2{ left:14%; height:64px; }
+.proj-art-cut .b3{ left:20%; height:46px; }
+.proj-art-cut .b4{ left:42%; height:70px; }
+.proj-art-cut .b5{ left:48%; height:44px; }
+.proj-art-cut .b6{ left:54%; height:80px; }
+.proj-art-cut .b7{ left:76%; height:50px; }
+.proj-art-cut .b8{ left:82%; height:68px; }
+.proj-art-cut .b9{ left:88%; height:36px; }
+.proj-art-cut .gap{
+  position:absolute; top:0; bottom:0; width:12%;
+  background:repeating-linear-gradient(45deg, rgba(255,255,255,.05) 0 6px, transparent 6px 12px);
+  border-left:1px dashed var(--border); border-right:1px dashed var(--border);
+}
+.proj-art-cut .g1{ left:27%; }
+.proj-art-cut .g2{ left:61%; }
+
 /* mining artwork on the project card */
 .proj-art-mine{ background: #14141a; }
 .proj-art-mine .blk{

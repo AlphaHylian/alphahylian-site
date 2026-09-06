@@ -369,23 +369,36 @@ QuoteEffects.minecraft = () => {
   };
 };
 
-/* ---- paper: a pen stroke that traces the cursor across the whole panel ---- */
+/* ---- paper: a pen stroke that traces the cursor across the whole panel,
+       and letters it passes turning to ink ---- */
 QuoteEffects.paper = () => {
   const STROKE_MS = 2400;  // how long the ink takes to dry away
   const MIN_STEP = 3;      // px between recorded points
   const MAX_PTS = 420;
   const CHUNK = 14;        // segments per stroked path — batching keeps it cheap
+  const INK_REACH = 46;    // px around the nib that stains the letters
+  const INK_DECAY = 0.012; // per frame — letters fade back over ~1.4s
   let pts = [];
+  let inked = new Map();
   let raf = 0, running = true;
 
-  function onRender(){ refreshQuoteCache(); pts = []; }
+  function clearInk(){
+    inked.forEach((_, el) => { el.style.color = ''; });
+    inked = new Map();
+  }
+  function onRender(){ refreshQuoteCache(); pts = []; clearInk(); }
+
   function onMove(e){
     const x = e.clientX - qfxRect.left;
     const y = e.clientY - qfxRect.top;
     const last = pts[pts.length - 1];
-    if(last && Math.hypot(x - last.x, y - last.y) < MIN_STEP) return;
-    pts.push({ x, y, t: performance.now(), brk: false });
-    if(pts.length > MAX_PTS) pts.shift();
+    if(!last || Math.hypot(x - last.x, y - last.y) >= MIN_STEP){
+      pts.push({ x, y, t: performance.now(), brk: false });
+      if(pts.length > MAX_PTS) pts.shift();
+    }
+    for(const c of charCache){
+      if(Math.hypot(c.cx - e.clientX, c.cy - e.clientY) < INK_REACH) inked.set(c.el, 1);
+    }
   }
   // Pen lifts when the cursor leaves the panel — don't join across the gap.
   function onLeave(){ if(pts.length) pts[pts.length - 1].brk = true; }
@@ -393,6 +406,15 @@ QuoteEffects.paper = () => {
   function loop(){
     if(!running) return;
     const now = performance.now();
+
+    // letters stained by the nib, easing back to the body colour
+    inked.forEach((level, el) => {
+      const next = level - INK_DECAY;
+      if(next <= 0){ el.style.color = ''; inked.delete(el); return; }
+      inked.set(el, next);
+      el.style.color = `rgba(53,80,112,${(0.35 + 0.65 * next).toFixed(3)})`;
+    });
+
     while(pts.length && now - pts[0].t > STROKE_MS) pts.shift();
     qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
     qfxCtx.lineCap = 'round';
@@ -422,7 +444,12 @@ QuoteEffects.paper = () => {
 
   return {
     onMove, onLeave, onRender,
-    stop(){ running = false; cancelAnimationFrame(raf); qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height); }
+    stop(){
+      running = false;
+      cancelAnimationFrame(raf);
+      qfxCtx.clearRect(0, 0, qfxCanvas.width, qfxCanvas.height);
+      clearInk();
+    }
   };
 };
 
@@ -582,16 +609,30 @@ function pointerXY(e){
   return { x: e.clientX, y: e.clientY };
 }
 
+// A press only becomes a drag once the pointer actually moves — otherwise a
+// plain click on the model would drop head tracking and snap it to centre.
+const DRAG_THRESHOLD = 4;
+let dragArmed = false;
+let dragOriginX = 0, dragOriginY = 0;
+
 function startDrag(e){
   const p = pointerXY(e);
-  lastPointerX = p.x;
-  lastPointerY = p.y;
-  lookMode = 'dragging';
+  lastPointerX = dragOriginX = p.x;
+  lastPointerY = dragOriginY = p.y;
+  dragArmed = true;
 }
 
 function dragMove(e){
-  if(lookMode !== 'dragging') return;
+  if(!dragArmed && lookMode !== 'dragging') return;
   const p = pointerXY(e);
+  if(dragArmed){
+    if(Math.hypot(p.x - dragOriginX, p.y - dragOriginY) < DRAG_THRESHOLD){
+      lastPointerX = p.x; lastPointerY = p.y;
+      return;
+    }
+    dragArmed = false;
+    lookMode = 'dragging';
+  }
   const dx = p.x - lastPointerX;
   const dy = p.y - lastPointerY;
   lastPointerX = p.x;
@@ -601,6 +642,7 @@ function dragMove(e){
 }
 
 function endDrag(){
+  dragArmed = false;
   if(lookMode !== 'dragging') return;
   lookMode = 'resetting';
 }
@@ -613,39 +655,56 @@ window.addEventListener('mouseup', endDrag);
 window.addEventListener('touchend', endDrag);
 
 /* ---- punch on click ----
-   IdleAnimation drives the arms every frame, so it's swapped out for the
-   duration of the swing and restored when the arm is back at rest. */
-const PUNCH_MS = 340;
-const PUNCH_REACH = 1.75;   // radians the right arm swings forward
-let punchStart = -1;
-let savedAnimation = null;
+   Uses skinview3d's own HitAnimation, layered onto the running IdleAnimation
+   via PlayerAnimation.addAnimation() so it plays once and removes itself.
+   Reassigning viewer.animation is avoided on purpose: that setter calls
+   playerObject.resetJoints(), which zeroes the head and makes the model
+   visibly lose cursor tracking for a moment after every click. */
+const HIT_SPEED = 1.9;                                // playback rate of the swing
+const HIT_PERIOD = (2 * Math.PI / 18) / HIT_SPEED;    // exactly one full swing
+let hitAnim = null;
+let punchId = null;
 
 function triggerPunch(){
-  if(!viewer || !viewer.playerObject || punchStart >= 0) return;
-  savedAnimation = viewer.animation;
-  viewer.animation = null;
-  punchStart = performance.now();
+  if(!viewer || !viewer.playerObject || !viewer.animation) return;
+  if(punchId !== null) return;
+  if(!hitAnim) hitAnim = new skinview3d.HitAnimation();
+  const anim = viewer.animation;
+
+  punchId = anim.addAnimation((player, progress, id) => {
+    if(progress >= HIT_PERIOD){
+      anim.removeAnimation(id);
+      if(punchId === id) punchId = null;
+      return;
+    }
+    const skin = player.skin;
+    // The idle pose for this frame is already applied, so capture it and blend
+    // the swing in and out against it — no snap at either end.
+    const rest = {
+      rax: skin.rightArm.rotation.x, raz: skin.rightArm.rotation.z,
+      lax: skin.leftArm.rotation.x,  laz: skin.leftArm.rotation.z,
+      lpx: skin.leftArm.position.x,  lpz: skin.leftArm.position.z,
+      by:  skin.body.rotation.y
+    };
+
+    hitAnim.progress = progress * HIT_SPEED;
+    hitAnim.animate(player);
+
+    const edge = Math.min(progress, HIT_PERIOD - progress) / (HIT_PERIOD * 0.3);
+    const e = Math.max(0, Math.min(1, edge));
+    const k = e * e * (3 - 2 * e);                    // smoothstep
+    const mix = (cur, base) => base + (cur - base) * k;
+    skin.rightArm.rotation.x = mix(skin.rightArm.rotation.x, rest.rax);
+    skin.rightArm.rotation.z = mix(skin.rightArm.rotation.z, rest.raz);
+    skin.leftArm.rotation.x  = mix(skin.leftArm.rotation.x,  rest.lax);
+    skin.leftArm.rotation.z  = mix(skin.leftArm.rotation.z,  rest.laz);
+    skin.leftArm.position.x  = mix(skin.leftArm.position.x,  rest.lpx);
+    skin.leftArm.position.z  = mix(skin.leftArm.position.z,  rest.lpz);
+    skin.body.rotation.y     = mix(skin.body.rotation.y,     rest.by);
+  });
 }
 window.addEventListener('mousedown', triggerPunch);
 window.addEventListener('touchstart', triggerPunch, { passive: true });
-
-function updatePunch(){
-  if(punchStart < 0) return;
-  const skin = viewer.playerObject && viewer.playerObject.skin;
-  const arm = skin && skin.rightArm;
-  if(!arm){ punchStart = -1; viewer.animation = savedAnimation; return; }
-  const p = Math.min(1, (performance.now() - punchStart) / PUNCH_MS);
-  const swing = p < 0.34 ? p / 0.34 : 1 - (p - 0.34) / 0.66;
-  const ease = swing * swing * (3 - 2 * swing);   // smoothstep
-  arm.rotation.x = -PUNCH_REACH * ease;
-  arm.rotation.z = 0.1 * ease;
-  if(p >= 1){
-    arm.rotation.x = 0;
-    arm.rotation.z = 0;
-    viewer.animation = savedAnimation;
-    punchStart = -1;
-  }
-}
 
 function overflowPast(value, limit){
   if(value > limit) return value - limit;
@@ -655,7 +714,6 @@ function overflowPast(value, limit){
 
 function updateHeadLook(){
   if(!viewer) return;
-  updatePunch();
 
   const wrapper = viewer.playerWrapper;
   const head = viewer.playerObject && viewer.playerObject.skin.head;
@@ -810,12 +868,15 @@ Backgrounds.constellation = () => makeBg(() => {
     waves = [];
   }
 
-  // Click sends out a shockwave that shoves stars aside and flares them up.
+  // Click sends out a gentle ripple — a slight nudge and a brief brightening,
+  // nothing that visibly rearranges the constellation.
   const WAVE_MS = 900;
-  const WAVE_SPEED = 620;     // px/s
+  const WAVE_SPEED = 460;     // px/s
+  const WAVE_BAND = 46;       // how wide the ripple front is
+  const WAVE_PUSH = 1.2;      // px/frame at the very centre of the front
   function click(x, y){
     waves.push({ x, y, t: performance.now() });
-    if(waves.length > 5) waves.shift();
+    if(waves.length > 3) waves.shift();
   }
 
   function frame(dt, t){
@@ -840,8 +901,6 @@ Backgrounds.constellation = () => makeBg(() => {
       p.age += dt;
       if(p.age >= p.life){ Object.assign(p, makeBright()); }
       p.x += p.vx; p.y += p.vy;
-      if(p.x < 0 || p.x > bgW) p.vx *= -1;
-      if(p.y < 0 || p.y > bgH) p.vy *= -1;
 
       const dx = p.x - mouse.x, dy = p.y - mouse.y;
       const dist = Math.hypot(dx, dy);
@@ -857,29 +916,39 @@ Backgrounds.constellation = () => makeBg(() => {
         const wx = p.x - w.x, wy = p.y - w.y;
         const d = Math.hypot(wx, wy);
         const band = Math.abs(d - ring);
-        if(band < 70 && d > 0.001){
-          const push = (1 - band / 70) * (1 - age) * 7;
-          p.x += (wx / d) * push;
-          p.y += (wy / d) * push;
-          p.flare = Math.max(p.flare, (1 - band / 70) * (1 - age));
+        if(band < WAVE_BAND && d > 0.001){
+          const strength = (1 - band / WAVE_BAND) * (1 - age);
+          p.x += (wx / d) * strength * WAVE_PUSH;
+          p.y += (wy / d) * strength * WAVE_PUSH;
+          p.flare = Math.max(p.flare, strength * 0.5);
         }
       }
-      p.flare *= 0.94;
+      p.flare *= 0.93;
+
+      // Clamp back on screen and turn the velocity inward. The cursor and the
+      // click ripple can shove a star past the edge; only flipping velocity
+      // (the old behaviour) left it stranded outside, flipping every frame and
+      // never returning — after some clicking enough stars were gone that the
+      // constellation lines visibly fell apart.
+      if(p.x < 0){ p.x = 0; p.vx = Math.abs(p.vx); }
+      else if(p.x > bgW){ p.x = bgW; p.vx = -Math.abs(p.vx); }
+      if(p.y < 0){ p.y = 0; p.vy = Math.abs(p.vy); }
+      else if(p.y > bgH){ p.y = bgH; p.vy = -Math.abs(p.vy); }
+
       p._e = envelope(p);
     }
 
     for(const p of bright){
-      const a = 0.78 * p._e + p.flare * 0.9;
-      bgCtx.fillStyle = `rgba(${(150 + p.flare * 105) | 0},${(120 + p.flare * 110) | 0},255,${Math.min(1, a).toFixed(3)})`;
-      const s = p.size + (p.flare > 0.4 ? 1 : 0);
-      bgCtx.fillRect(p.x, p.y, s, s);
+      const a = 0.78 * p._e + p.flare * 0.35;
+      bgCtx.fillStyle = `rgba(${(150 + p.flare * 70) | 0},${(120 + p.flare * 80) | 0},255,${Math.min(1, a).toFixed(3)})`;
+      bgCtx.fillRect(p.x, p.y, p.size, p.size);
     }
 
-    // faint expanding ring so the shockwave reads even in sparse areas
+    // barely-there expanding ring so the ripple still reads in sparse areas
     for(const w of waves){
       const age = (t - w.t) / WAVE_MS;
-      bgCtx.strokeStyle = `rgba(168,136,255,${(0.35 * (1 - age)).toFixed(3)})`;
-      bgCtx.lineWidth = 2 * (1 - age) + 0.5;
+      bgCtx.strokeStyle = `rgba(168,136,255,${(0.1 * (1 - age)).toFixed(3)})`;
+      bgCtx.lineWidth = 1;
       bgCtx.beginPath();
       bgCtx.arc(w.x, w.y, age * WAVE_SPEED, 0, Math.PI * 2);
       bgCtx.stroke();
@@ -908,15 +977,17 @@ Backgrounds.constellation = () => makeBg(() => {
   return { init, resize: init, frame, click };
 });
 
-/* ---- terminal: dim falling 1s and 0s; clicking sends a bright ring ---- */
+/* ---- terminal: dim falling 1s and 0s that light up under the cursor;
+       clicking drops a bright data packet down that column ---- */
 Backgrounds.terminal = () => makeBg(() => {
   const FONT = 14, COL = 14, ROW = 16;
-  const BASE_ALPHA = 0.03;    // dim, and deliberately unaffected by the cursor
-  const PULSE_MS = 1500;
-  const PULSE_SPEED = 720;    // px/s
-  const PULSE_BAND = 60;
+  const BASE_ALPHA = 0.03;    // dim at rest
+  const CURSOR_R = 135;       // glyphs within this of the cursor brighten
+  const CURSOR_BOOST = 0.8;
+  const STREAM_SPEED = 900;   // px/s the packet falls
+  const STREAM_TAIL = 190;    // px of glowing tail behind its head
   let cols = 0, rows = 0, totalH = 0, offs = [], speed = [], glyphs = [];
-  let pulses = [];
+  let streams = [];
 
   function init(){
     cols = Math.ceil(bgW / COL) + 1;
@@ -927,12 +998,16 @@ Backgrounds.terminal = () => makeBg(() => {
     // Sparse: most cells are empty, so the rain stays faint and cheap to draw.
     glyphs = Array.from({ length: cols }, () =>
       Array.from({ length: rows }, () => (Math.random() < 0.3 ? (Math.random() < 0.5 ? '0' : '1') : null)));
-    pulses = [];
+    streams = [];
   }
 
+  // A click fires a packet down the clicked column (and its neighbours).
   function click(x, y){
-    pulses.push({ x, y, t: performance.now() });
-    if(pulses.length > 4) pulses.shift();
+    const c = Math.round(x / COL);
+    for(let k = -1; k <= 1; k++){
+      streams.push({ col: c + k, y: y - Math.abs(k) * 30, head: y - Math.abs(k) * 30 });
+    }
+    if(streams.length > 24) streams.splice(0, streams.length - 24);
   }
 
   function frame(dt, t){
@@ -941,25 +1016,41 @@ Backgrounds.terminal = () => makeBg(() => {
     bgCtx.font = `${FONT}px 'JetBrains Mono', ui-monospace, Menlo, monospace`;
     bgCtx.textBaseline = 'top';
 
-    for(let i = pulses.length - 1; i >= 0; i--){
-      if(t - pulses[i].t > PULSE_MS) pulses.splice(i, 1);
+    for(let i = streams.length - 1; i >= 0; i--){
+      streams[i].head += STREAM_SPEED * dt / 1000;
+      if(streams[i].head - STREAM_TAIL > bgH) streams.splice(i, 1);
     }
 
     for(let c = 0; c < cols; c++){
       offs[c] = (offs[c] + speed[c] * dt / 1000) % totalH;
       const x = c * COL;
+      // packets running down this column right now
+      const colStreams = streams.length ? streams.filter(s => s.col === c) : null;
+
       for(let r = 0; r < rows; r++){
         const g = glyphs[c][r];
         if(g === null) continue;
         const y = (r * ROW + offs[c]) % totalH - ROW;
+
         let a = BASE_ALPHA;
-        for(const p of pulses){
-          const age = (t - p.t) / PULSE_MS;
-          const ring = age * PULSE_SPEED;
-          const band = Math.abs(Math.hypot(x - p.x, y - p.y) - ring);
-          if(band < PULSE_BAND) a += (1 - band / PULSE_BAND) * (1 - age) * 0.9;
+        const d = Math.hypot(x - mouse.x, y - mouse.y);
+        if(d < CURSOR_R) a += (1 - d / CURSOR_R) * CURSOR_BOOST;
+
+        let head = 0;
+        if(colStreams){
+          for(const s of colStreams){
+            const behind = s.head - y;
+            if(behind >= 0 && behind < STREAM_TAIL){
+              const f = 1 - behind / STREAM_TAIL;
+              a += f;
+              if(behind < ROW * 1.5) head = Math.max(head, 1 - behind / (ROW * 1.5));
+            }
+          }
         }
-        bgCtx.fillStyle = `rgba(53,255,133,${Math.min(1, a).toFixed(3)})`;
+
+        bgCtx.fillStyle = head > 0
+          ? `rgba(${(190 + 65 * head) | 0},255,${(190 + 60 * head) | 0},${Math.min(1, a).toFixed(3)})`
+          : `rgba(53,255,133,${Math.min(1, a).toFixed(3)})`;
         bgCtx.fillText(g, x, y);
       }
       if(Math.random() < 0.04){
@@ -990,6 +1081,21 @@ Backgrounds.minecraft = () => makeBg(() => {
     { c: '#7ce9e0', chance: 0.005 },   // diamond
     { c: '#e04a4a', chance: 0.009 }    // redstone
   ];
+  // Stone variants rather than dirt — reads as a proper cave wall.
+  const ROCKS = [
+    { base: [124, 122, 120], w: 0.52 },   // stone
+    { base: [104, 102, 100], w: 0.22 },   // cobblestone
+    { base: [ 74,  74,  82], w: 0.16 },   // deepslate
+    { base: [141, 139, 136], w: 0.10 }    // andesite
+  ];
+  function pickRock(){
+    let r = Math.random();
+    for(const rock of ROCKS){
+      if(r < rock.w) return rock.base;
+      r -= rock.w;
+    }
+    return ROCKS[0].base;
+  }
 
   const clamp255 = v => Math.max(0, Math.min(255, v | 0));
 
@@ -1006,8 +1112,7 @@ Backgrounds.minecraft = () => makeBg(() => {
     for(let cx = 0; cx < cols; cx++){
       for(let cy = 0; cy < rows; cy++){
         const x = cx * CELL, y = cy * CELL;
-        const dirt = Math.random() < 0.15;
-        const base = dirt ? [124, 94, 62] : [124, 122, 120];
+        const base = pickRock();
         f.fillStyle = `rgb(${base[0]},${base[1]},${base[2]})`;
         f.fillRect(x, y, CELL, CELL);
 
@@ -1123,47 +1228,67 @@ Backgrounds.minecraft = () => makeBg(() => {
   return { init, resize: init, frame, click };
 });
 
-/* ---- paper: ink blots that bloom then dry, a droplet trail off the cursor,
-       and a splatter on click ---- */
+/* ---- paper: ambient stains that bloom then dry, a connected ink trail off
+       the cursor, and an ink bloom that wicks into the paper on click ---- */
 Backgrounds.paper = () => makeBg(() => {
-  const DROP_MS = 70;         // how often the cursor sheds a droplet
+  const DROP_MS = 90;          // how often the trail sheds a droplet
+  const TRAIL_MS = 2600;       // how long the trail stays wet
+  const TRAIL_STEP = 5;        // px between recorded trail points
+  const MAX_TRAIL = 260;
   let blots = [];
+  let blooms = [];
+  let trail = [];
   let lastDrop = 0;
 
-  function makeBlot(x, y, kind){
-    // kind: 'big' (ambient stain) | 'drop' (cursor trail) | 'splat' (click)
-    const big = kind === 'big';
-    const splat = kind === 'splat';
+  function makeBlot(x, y, big){
     return {
       x: x == null ? Math.random() * bgW : x,
       y: y == null ? Math.random() * bgH : y,
-      r: big ? 10 + Math.random() * 22 : splat ? 5 + Math.random() * 14 : 2 + Math.random() * 4,
+      r: big ? 10 + Math.random() * 22 : 2 + Math.random() * 3.5,
       age: 0,
-      grow: big ? 1400 + Math.random() * 1600 : splat ? 380 : 320,
-      life: big ? 9000 + Math.random() * 8000 : splat ? 4200 : 1900,
+      grow: big ? 1400 + Math.random() * 1600 : 300,
+      life: big ? 9000 + Math.random() * 8000 : TRAIL_MS,
       seed: Math.random() * 1000,
-      max: big ? 0.5 : splat ? 0.55 : 0.3
+      max: big ? 0.5 : 0.34
     };
   }
 
   function init(){
     blots = Array.from({ length: 7 }, () => {
-      const b = makeBlot(null, null, 'big');
+      const b = makeBlot(null, null, true);
       b.age = Math.random() * b.life;
       return b;
     });
+    blooms = [];
+    trail = [];
     lastDrop = 0;
   }
 
+  // Click = a single drop of ink landing and wicking outward through the paper
+  // fibres: one soft stain that swells fast, then dries to a pale mark.
+  const BLOOM_MS = 5200;
   function click(x, y){
-    blots.push(makeBlot(x, y, 'splat'));
-    const n = 9 + ((Math.random() * 6) | 0);
-    for(let i = 0; i < n; i++){
-      const ang = Math.random() * Math.PI * 2;
-      const dist = 14 + Math.random() * 76;
-      blots.push(makeBlot(x + Math.cos(ang) * dist, y + Math.sin(ang) * dist, 'splat'));
+    blooms.push({
+      x, y,
+      t: performance.now(),
+      max: 46 + Math.random() * 26,
+      seed: Math.random() * 1000,
+      spikes: 7 + ((Math.random() * 5) | 0)
+    });
+    if(blooms.length > 14) blooms.shift();
+  }
+
+  function inkBlobPath(x, y, r, seed, wobA, wobB){
+    bgCtx.beginPath();
+    const steps = 22;
+    for(let k = 0; k <= steps; k++){
+      const ang = (k / steps) * Math.PI * 2;
+      const wob = 1 + wobA * Math.sin(ang * 3 + seed) + wobB * Math.cos(ang * 5 - seed);
+      const px = x + Math.cos(ang) * r * wob;
+      const py = y + Math.sin(ang) * r * wob;
+      k === 0 ? bgCtx.moveTo(px, py) : bgCtx.lineTo(px, py);
     }
-    if(blots.length > 160) blots.splice(0, blots.length - 160);
+    bgCtx.closePath();
   }
 
   function frame(dt, t){
@@ -1178,14 +1303,40 @@ Backgrounds.paper = () => makeBg(() => {
       bgCtx.stroke();
     }
 
-    // frequent small droplets so the cursor leaves a subtle trail
-    if(mouse.x >= 0 && t - lastDrop > DROP_MS){
-      lastDrop = t;
-      blots.push(makeBlot(mouse.x + (Math.random() - 0.5) * 7,
-                          mouse.y + (Math.random() - 0.5) * 7, 'drop'));
-      if(blots.length > 200) blots.shift();
+    /* --- cursor ink trail: a continuous stroke with droplets sitting on it --- */
+    if(mouse.x >= 0){
+      const last = trail[trail.length - 1];
+      if(!last || Math.hypot(mouse.x - last.x, mouse.y - last.y) >= TRAIL_STEP){
+        trail.push({ x: mouse.x, y: mouse.y, t });
+        if(trail.length > MAX_TRAIL) trail.shift();
+      }
+      if(t - lastDrop > DROP_MS){
+        lastDrop = t;
+        blots.push(makeBlot(mouse.x + (Math.random() - 0.5) * 6,
+                            mouse.y + (Math.random() - 0.5) * 6, false));
+        if(blots.length > 200) blots.shift();
+      }
+    }
+    while(trail.length && t - trail[0].t > TRAIL_MS) trail.shift();
+
+    // draw the trail in short chunks so each can carry its own age/alpha
+    bgCtx.lineCap = 'round';
+    bgCtx.lineJoin = 'round';
+    const CHUNK = 10;
+    for(let start = 0; start < trail.length - 1; start += CHUNK){
+      const end = Math.min(trail.length - 1, start + CHUNK);
+      const age = (t - trail[(start + end) >> 1].t) / TRAIL_MS;
+      const alpha = Math.max(0, 1 - age) * 0.4;
+      if(alpha <= 0.01) continue;
+      bgCtx.strokeStyle = `rgba(48,34,22,${alpha.toFixed(3)})`;
+      bgCtx.lineWidth = 3.4 * (1 - age * 0.6) + 0.6;
+      bgCtx.beginPath();
+      bgCtx.moveTo(trail[start].x, trail[start].y);
+      for(let i = start + 1; i <= end; i++) bgCtx.lineTo(trail[i].x, trail[i].y);
+      bgCtx.stroke();
     }
 
+    /* --- blots (ambient stains + trail droplets) --- */
     for(let i = blots.length - 1; i >= 0; i--){
       const b = blots[i];
       b.age += dt;
@@ -1194,17 +1345,7 @@ Backgrounds.paper = () => makeBg(() => {
       const r = b.r * (0.3 + 0.7 * growth);
       const fade = b.age > b.life * 0.6 ? 1 - (b.age - b.life * 0.6) / (b.life * 0.4) : 1;
       const alpha = b.max * fade * (0.55 + 0.45 * growth);
-
-      bgCtx.beginPath();
-      const steps = 20;
-      for(let k = 0; k <= steps; k++){
-        const ang = (k / steps) * Math.PI * 2;
-        const wob = 1 + 0.12 * Math.sin(ang * 3 + b.seed) + 0.06 * Math.cos(ang * 5 - b.seed);
-        const px = b.x + Math.cos(ang) * r * wob;
-        const py = b.y + Math.sin(ang) * r * wob;
-        k === 0 ? bgCtx.moveTo(px, py) : bgCtx.lineTo(px, py);
-      }
-      bgCtx.closePath();
+      inkBlobPath(b.x, b.y, r, b.seed, 0.12, 0.06);
       const dried = b.age > b.grow * 1.6;
       bgCtx.fillStyle = dried
         ? `rgba(96,72,50,${(alpha * 0.3).toFixed(3)})`
@@ -1212,7 +1353,35 @@ Backgrounds.paper = () => makeBg(() => {
       bgCtx.fill();
     }
 
-    if(blots.length < 11 && Math.random() < 0.003) blots.push(makeBlot(null, null, 'big'));
+    /* --- click blooms --- */
+    for(let i = blooms.length - 1; i >= 0; i--){
+      const b = blooms[i];
+      const age = (t - b.t) / BLOOM_MS;
+      if(age >= 1){ blooms.splice(i, 1); continue; }
+      // swells quickly, then creeps
+      const grow = 1 - Math.exp(-age * 7);
+      const r = b.max * (0.18 + 0.82 * grow);
+      const wet = Math.max(0, 1 - age * 3.2);
+      const alpha = 0.14 + 0.4 * wet;
+
+      // fine tendrils wicking along the paper fibres
+      bgCtx.strokeStyle = `rgba(52,38,24,${(alpha * 0.55).toFixed(3)})`;
+      bgCtx.lineWidth = 1.1;
+      for(let s = 0; s < b.spikes; s++){
+        const ang = (s / b.spikes) * Math.PI * 2 + b.seed;
+        const len = r * (1.05 + 0.5 * Math.abs(Math.sin(b.seed + s * 2.7)));
+        bgCtx.beginPath();
+        bgCtx.moveTo(b.x + Math.cos(ang) * r * 0.7, b.y + Math.sin(ang) * r * 0.7);
+        bgCtx.lineTo(b.x + Math.cos(ang) * len, b.y + Math.sin(ang) * len);
+        bgCtx.stroke();
+      }
+
+      inkBlobPath(b.x, b.y, r, b.seed, 0.16, 0.09);
+      bgCtx.fillStyle = `rgba(${(40 + 56 * (1 - wet)) | 0},${(28 + 44 * (1 - wet)) | 0},${(18 + 32 * (1 - wet)) | 0},${alpha.toFixed(3)})`;
+      bgCtx.fill();
+    }
+
+    if(blots.length < 11 && Math.random() < 0.003) blots.push(makeBlot(null, null, true));
   }
 
   return { init, resize: init, frame, click };

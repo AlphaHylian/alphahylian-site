@@ -674,10 +674,12 @@ let punchId = null;
    Tracking normally leaves the body square on and lets the head do the
    looking, which means a punch aimed off to one side swings across the
    model's own chest. For the length of the swing the body comes round to
-   face the cursor properly, then eases back to the resting pose. */
+   face the cursor properly, and then it simply stays there — the ordinary
+   tracking deadband holds it, and moving the cursor or dragging the model
+   squares it up again on its own. Unwinding it deliberately just looked
+   like the model changing its mind. */
 const PUNCH_TURN_IN = 0.09;         // seconds to come round
-const PUNCH_TURN_HOLD = HIT_PERIOD; // stay facing while the arm is out
-const PUNCH_TURN_OUT = 0.45;        // and unwind
+const PUNCH_TURN_HOLD = HIT_PERIOD; // stay driven while the arm is out
 const PUNCH_TURN_SPEED = 0.3;
 let punchTurnStart = -1;
 
@@ -690,10 +692,10 @@ function punchTurnAmount(){
     return k * k * (3 - 2 * k);
   }
   if(t < PUNCH_TURN_IN + PUNCH_TURN_HOLD) return 1;
-  const k = (t - PUNCH_TURN_IN - PUNCH_TURN_HOLD) / PUNCH_TURN_OUT;
-  if(k >= 1){ punchTurnStart = -1; return 0; }
-  const e = 1 - k;
-  return e * e * (3 - 2 * e);
+  // Dropping straight to 0 doesn't snap: the body is already sitting on the
+  // look direction, so the assist below finds nothing left to correct.
+  punchTurnStart = -1;
+  return 0;
 }
 
 function triggerPunch(){

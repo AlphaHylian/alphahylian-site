@@ -42,7 +42,10 @@ const QUALITY = {
 
 // A filter graph gets unwieldy long before ffmpeg refuses it; past this we ask
 // for a longer minimum silence rather than building a 1200-filter command.
+// The browser-encoder path builds no graph at all — it just walks the ranges —
+// so it only needs a limit loose enough to catch a runaway setting.
 const MAX_SEGMENTS = 400;
+const MAX_SEGMENTS_FAST = 20000;
 const MIN_CLIP = 0.12;     // seconds; drop keep-ranges shorter than this
 const HOP_SECONDS = 0.02;  // analysis window
 
@@ -91,9 +94,11 @@ const state = {
   file: null,
   ext: 'mp4',
   duration: 0,
-  pcm: null,          // Float32Array, mono
+  env: null,          // Float32Array of per-hop peaks — all the waveform needs
   waveGain: 1,        // display-only scale so quiet recordings still show up
-  sampleRate: 0,
+  audioRate: 0,       // source audio rate/channels, kept for the encoder
+  audioChannels: 0,
+  ffInput: false,     // has the source been copied into ffmpeg's filesystem yet
   frameDb: null,      // Float32Array of per-hop dBFS
   keep: [],           // [[start,end], ...] seconds
   level: 'even',
@@ -166,21 +171,6 @@ async function loadFFmpeg(onNote) {
 }
 
 /* -------------------------------------------------- silence analysis */
-// Per-hop RMS in dBFS. Done once per file; the sliders only re-run findKeep().
-function computeFrameDb(pcm, sampleRate) {
-  const hop = Math.max(1, Math.round(sampleRate * HOP_SECONDS));
-  const n = Math.floor(pcm.length / hop);
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    let sum = 0;
-    const start = i * hop;
-    for (let j = 0; j < hop; j++) { const v = pcm[start + j]; sum += v * v; }
-    const rms = Math.sqrt(sum / hop);
-    out[i] = rms > 1e-7 ? 20 * Math.log10(rms) : -120;
-  }
-  return out;
-}
-
 /**
  * Turn the dB envelope into ranges worth keeping.
  * threshold dBFS, minSilence/pad in seconds.
@@ -268,15 +258,60 @@ function keptDuration(keep) {
 /* ------------------------------------------------------------ waveform */
 // Absolute level says nothing useful here — a quietly recorded take would draw
 // as a flat line. Scale the display so the loudest peak fills the panel.
-function waveGainFor(pcm) {
+function waveGainFor(env) {
   let peak = 0;
-  const step = Math.max(1, Math.floor(pcm.length / 200000));
-  for (let i = 0; i < pcm.length; i += step) {
-    const v = Math.abs(pcm[i]);
-    if (v > peak) peak = v;
-  }
+  for (let i = 0; i < env.length; i++) if (env[i] > peak) peak = env[i];
   return peak > 0.001 ? 1 / peak : 1;
 }
+
+/* Per-hop RMS and peak, accumulated as the audio decodes.
+
+   Keeping the decoded samples around instead would cost about half a gigabyte
+   for a two-hour recording, and nothing downstream actually wants them: the
+   cut detector needs one dB figure per 20 ms hop and the waveform needs one
+   peak per hop, so both get built on the way past and the samples are dropped.
+   ------------------------------------------------------------------------ */
+function Analyser(sampleRate) {
+  this.hop = Math.max(1, Math.round(sampleRate * HOP_SECONDS));
+  this.sum = 0;
+  this.peak = 0;
+  this.n = 0;
+  this.db = [];
+  this.env = [];
+  this.total = 0;
+}
+
+Analyser.prototype._closeHop = function () {
+  const rms = Math.sqrt(this.sum / this.hop);
+  this.db.push(rms > 1e-7 ? 20 * Math.log10(rms) : -120);
+  this.env.push(this.peak);
+  this.sum = 0; this.peak = 0; this.n = 0;
+};
+
+Analyser.prototype.push = function (chans, count) {
+  const ch = chans.length;
+  for (let i = 0; i < count; i++) {
+    let v = 0;
+    for (let c = 0; c < ch; c++) v += chans[c][i];
+    v /= ch;
+    const a = v < 0 ? -v : v;
+    if (a > this.peak) this.peak = a;
+    this.sum += v * v;
+    if (++this.n === this.hop) this._closeHop();
+  }
+  this.total += count;
+};
+
+Analyser.prototype.finish = function () {
+  // A partial last hop is scaled as if it were full, so a tail that is half a
+  // hop long doesn't read as suddenly quiet and get trimmed.
+  if (this.n > 0) {
+    const rms = Math.sqrt(this.sum / this.n);
+    this.db.push(rms > 1e-7 ? 20 * Math.log10(rms) : -120);
+    this.env.push(this.peak);
+  }
+  return { frameDb: Float32Array.from(this.db), env: Float32Array.from(this.env), samples: this.total };
+};
 
 function drawWave() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -295,7 +330,7 @@ function drawWave() {
   g.fillStyle = panelAlt;
   g.fillRect(0, 0, w, h);
 
-  if (!state.pcm || !state.duration) return;
+  if (!state.env || !state.duration) return;
 
   // Shade every stretch that is going to be removed, and rule a line at each
   // cut, so what survives is obvious at a glance rather than implied.
@@ -314,9 +349,9 @@ function drawWave() {
   };
   for (const [s0, e0] of state.keep) { shadeCut(prevEnd, s0); prevEnd = e0; }
   shadeCut(prevEnd, state.duration);
-  const pcm = state.pcm;
+  const env = state.env;
   const mid = h / 2;
-  const perPx = pcm.length / w;
+  const perPx = env.length / w;
 
   // cut regions get a dim wash so the kept parts read as the signal
   const inKeep = new Uint8Array(w);
@@ -328,9 +363,9 @@ function drawWave() {
 
   for (let x = 0; x < w; x++) {
     const start = Math.floor(x * perPx);
-    const end = Math.min(pcm.length, Math.floor((x + 1) * perPx));
+    const end = Math.max(start + 1, Math.min(env.length, Math.floor((x + 1) * perPx)));
     let peak = 0;
-    for (let i = start; i < end; i++) { const v = Math.abs(pcm[i]); if (v > peak) peak = v; }
+    for (let i = start; i < end; i++) if (env[i] > peak) peak = env[i];
     const amp = Math.max(1, Math.min(mid, peak * state.waveGain * mid * 0.95));
     g.fillStyle = inKeep[x] ? accent : faint;
     g.globalAlpha = inKeep[x] ? 0.95 : 0.25;
@@ -389,7 +424,8 @@ function recompute() {
   renderStats();
   drawWave();
 
-  if (state.keep.length > MAX_SEGMENTS) {
+  const cap = (fastPathPossible() && state.audioRate > 0) ? MAX_SEGMENTS_FAST : MAX_SEGMENTS;
+  if (state.keep.length > cap) {
     showError(`That produces ${state.keep.length} separate clips, which is more than ` +
       `Cutdown will stitch in one pass. Raise "min silence to cut" a little.`);
     goEl.disabled = true;
@@ -407,6 +443,7 @@ async function handleFile(file) {
   if (state.outUrl) { URL.revokeObjectURL(state.outUrl); state.outUrl = null; }
 
   state.file = file;
+  state.ffInput = false;
   const dot = file.name.lastIndexOf('.');
   state.ext = dot > -1 ? file.name.slice(dot + 1).toLowerCase() : 'mp4';
   filenameEl.textContent = `${file.name} · ${fmtSize(file.size)}`;
@@ -421,33 +458,63 @@ async function handleFile(file) {
   barEl.style.width = '0%';
 
   try {
-    plabelEl.textContent = 'Loading the video engine…';
-    await loadFFmpeg(msg => { plabelEl.textContent = msg; });
+    let analysed = false;
+    if (fastPathPossible()) {
+      // No ffmpeg at all on this path: no 32 MB download, and no second copy
+      // of the source sitting in a wasm heap.
+      try {
+        plabelEl.textContent = 'Reading the audio…';
+        barEl.style.width = '15%';
+        const a = await analyseWithWebCodecs(file, p => {
+          barEl.style.width = (15 + 75 * p).toFixed(0) + '%';
+        });
+        state.frameDb = a.frameDb;
+        state.env = a.env;
+        state.audioRate = a.sampleRate;
+        state.audioChannels = a.channels;
+        state.duration = a.duration;
+        state.waveGain = waveGainFor(a.env);
+        analysed = true;
+      } catch (err) {
+        // An .mp4 that isn't one, or a codec this browser won't decode. ffmpeg
+        // sniffs the actual contents rather than trusting the extension, so
+        // let it have a go before giving up on the file.
+        if (/no audio track/.test(err && err.message)) throw err;
+        console.warn('[cutdown] fast analysis unavailable, using ffmpeg:', err);
+        state.audioRate = 0;
+      }
+    }
+    if (!analysed) {
+      plabelEl.textContent = 'Loading the video engine…';
+      await loadFFmpeg(msg => { plabelEl.textContent = msg; });
 
-    plabelEl.textContent = 'Reading the audio…';
-    barEl.style.width = '35%';
-    const inName = 'input.' + state.ext;
-    await ffmpeg.writeFile(inName, await fetchFile(file));
+      plabelEl.textContent = 'Reading the audio…';
+      barEl.style.width = '35%';
+      await ensureFFmpegInput();
 
-    // 16 kHz mono is plenty for level analysis and keeps this pass quick.
-    await ffmpeg.exec(['-i', inName, '-vn', '-ac', '1', '-ar', '16000', '-f', 'wav', 'probe.wav']);
-    const wav = await ffmpeg.readFile('probe.wav');
+      // 16 kHz mono is plenty for level analysis and keeps this pass quick.
+      await ffmpeg.exec(['-i', 'input.' + state.ext, '-vn', '-ac', '1', '-ar', '16000', '-f', 'wav', 'probe.wav']);
+      const wav = await ffmpeg.readFile('probe.wav');
 
-    plabelEl.textContent = 'Analysing…';
-    barEl.style.width = '75%';
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const actx = new AC();
-    // slice() because decodeAudioData detaches the buffer it is handed
-    const audio = await actx.decodeAudioData(wav.buffer.slice(0));
-    actx.close();
+      plabelEl.textContent = 'Analysing…';
+      barEl.style.width = '75%';
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const actx = new AC();
+      // slice() because decodeAudioData detaches the buffer it is handed
+      const audio = await actx.decodeAudioData(wav.buffer.slice(0));
+      actx.close();
 
-    state.pcm = audio.getChannelData(0);
-    state.sampleRate = audio.sampleRate;
-    state.duration = audio.duration;
-    state.frameDb = computeFrameDb(state.pcm, state.sampleRate);
-    state.waveGain = waveGainFor(state.pcm);
+      const pcm = audio.getChannelData(0);
+      const an = new Analyser(audio.sampleRate);
+      an.push([pcm], pcm.length);
+      const done = an.finish();
+      state.frameDb = done.frameDb;
+      state.env = done.env;
+      state.duration = audio.duration;
+      state.waveGain = waveGainFor(done.env);
 
-    await ffmpeg.deleteFile('probe.wav');
+      await ffmpeg.deleteFile('probe.wav');
+    }
 
     applyAuto(true);
 
@@ -457,8 +524,10 @@ async function handleFile(file) {
   } catch (err) {
     progEl.classList.remove('on');
     console.error(err);
-    showError('Could not read that file: ' + (err && err.message ? err.message : err) +
-      ' — try an MP4 or MOV.');
+    const msg = err && err.message ? err.message : String(err);
+    showError(/no audio track/.test(msg)
+      ? 'That file has no audio track, so there is nothing to cut on.'
+      : 'Could not read that file: ' + msg + ' — try an MP4 or MOV.');
   }
 }
 
@@ -488,6 +557,7 @@ async function processWithFFmpeg(onProgress) {
   const q = QUALITY[state.quality];
   const inName = 'input.' + state.ext;
 
+  await ensureFFmpegInput();
   const relay = ({ progress }) => onProgress(Math.max(0, Math.min(1, progress || 0)), 'Encoding…');
   ffmpeg.on('progress', relay);
   try {
@@ -545,7 +615,7 @@ async function process() {
 
   // The fast path needs an MP4/MOV the browser can decode; everything else
   // (MKV, WebM, exotic codecs) goes to ffmpeg.
-  const fastEligible = webCodecsAvailable() && /^(mp4|m4v|mov)$/i.test(state.ext);
+  const fastEligible = fastPathPossible() && state.audioRate > 0;
 
   try {
     if (fastEligible) {
@@ -747,7 +817,7 @@ window.addEventListener('resize', drawWave);
 })();
 
 /* expose the pure analysis for the headless test harness */
-window.__cutdown = { findKeep, computeFrameDb, buildFilterGraph, state, HOP_SECONDS };
+window.__cutdown = { findKeep, buildFilterGraph, Analyser, state, HOP_SECONDS };
 
 /* =====================================================================
    FAST PATH — WebCodecs
@@ -770,6 +840,20 @@ window.__cutdown = { findKeep, computeFrameDb, buildFilterGraph, state, HOP_SECO
    the video is. Firefox and Safari don't have the API, and fall back to the
    in-memory path.
    ------------------------------------------------------------------------ */
+
+/** MP4-ish container the browser can handle end to end without ffmpeg. */
+function fastPathPossible() {
+  return webCodecsAvailable() && typeof AudioDecoder !== 'undefined' &&
+         /^(mp4|m4v|mov)$/i.test(state.ext);
+}
+
+/** ffmpeg only ever sees the source if something actually needs ffmpeg. */
+async function ensureFFmpegInput() {
+  if (state.ffInput) return;
+  await loadFFmpeg(msg => { plabelEl.textContent = msg; });
+  await ffmpeg.writeFile('input.' + state.ext, await fetchFile(state.file));
+  state.ffInput = true;
+}
 
 function diskSaveAvailable() {
   return typeof window.showSaveFilePicker === 'function';
@@ -833,15 +917,23 @@ function keepIndexAt(keep, t) {
   return -1;
 }
 
-// The decoder wants the avcC/hvcC payload as `description`.
+// The decoder wants the codec's own setup payload as `description`: the
+// avcC/hvcC box for video, and for AAC the AudioSpecificConfig buried in esds.
 function codecDescription(trak) {
   const DS = window.DataStream || window.MP4Box.DataStream;
   for (const entry of trak.mdia.minf.stbl.stsd.entries) {
     const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
-    if (!box) continue;
-    const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
-    box.write(stream);
-    return new Uint8Array(stream.buffer, 8);   // strip the box header
+    if (box) {
+      const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
+      box.write(stream);
+      return new Uint8Array(stream.buffer, 8);   // strip the box header
+    }
+    if (entry.esds) {
+      try {
+        const asc = entry.esds.esd.descs[0].descs[0].data;
+        if (asc && asc.length) return new Uint8Array(asc);
+      } catch (_) { /* no decoder-specific info; the decoder may cope without */ }
+    }
   }
   return null;
 }
@@ -858,7 +950,8 @@ function codecDescription(trak) {
 
 const DEMUX_CHUNK = 8 * 1024 * 1024;
 
-async function openDemuxer(file) {
+async function openDemuxer(file, kind) {
+  kind = kind || 'video';
   const mp4 = window.MP4Box.createFile();
   let info = null, failed = null;
   mp4.onError = e => { failed = new Error('demux: ' + e); };
@@ -876,9 +969,10 @@ async function openDemuxer(file) {
     next = (typeof want === 'number' && want > start) ? want : start + DEMUX_CHUNK;
   }
   if (!info) throw new Error('no moov box — not a readable MP4');
-  if (!info.videoTracks || !info.videoTracks.length) throw new Error('no video track found');
+  const tracks = kind === 'audio' ? info.audioTracks : info.videoTracks;
+  if (!tracks || !tracks.length) throw new Error('no ' + kind + ' track found');
 
-  const track = info.videoTracks[0];
+  const track = tracks[0];
   const description = codecDescription(mp4.getTrackById(track.id));
 
   /** Pull every sample through `onSample`; it may return a promise to push back. */
@@ -922,6 +1016,90 @@ async function openDemuxer(file) {
   return { track, description, stream, total: track.nb_samples };
 }
 
+/* ----------------------------------------------------------- audio decode
+
+   The audio track goes through the browser's own decoder, a block at a time,
+   exactly like the video. Nothing here holds more than the block in hand, so
+   the length of the recording stops mattering.
+   ------------------------------------------------------------------------ */
+
+/** Decode the whole audio track, handing each block to `onBlock(chans, n)`. */
+async function decodeAudioTrack(file, onBlock, onProgress, onTick) {
+  const dm = await openDemuxer(file, 'audio');
+  const t = dm.track;
+  const channels = t.audio.channel_count;
+  const cfg = {
+    codec: t.codec,
+    sampleRate: t.audio.sample_rate,
+    numberOfChannels: channels
+  };
+  if (dm.description) cfg.description = dm.description;
+  const support = await AudioDecoder.isConfigSupported(cfg);
+  if (!support.supported) throw new Error('browser cannot decode ' + t.codec);
+
+  let failure = null;
+  const dec = new AudioDecoder({
+    output: data => {
+      try {
+        const n = data.numberOfFrames;
+        const chans = [];
+        for (let c = 0; c < data.numberOfChannels; c++) {
+          const a = new Float32Array(n);
+          data.copyTo(a, { planeIndex: c, format: 'f32-planar' });
+          chans.push(a);
+        }
+        onBlock(chans, n);
+      } catch (err) {
+        failure = err;
+      } finally {
+        data.close();
+      }
+    },
+    error: e => { failure = e; }
+  });
+  dec.configure(cfg);
+
+  let read = 0;
+  await dm.stream(async sample => {
+    if (failure) throw failure;
+    dec.decode(new EncodedAudioChunk({
+      type: sample.is_sync ? 'key' : 'delta',
+      timestamp: (sample.cts / sample.timescale) * 1e6,
+      duration: (sample.duration / sample.timescale) * 1e6,
+      data: sample.data
+    }));
+    if (dec.decodeQueueSize > 48) {
+      await new Promise(r => setTimeout(r, 0));
+      while (dec.decodeQueueSize > 24) await new Promise(r => setTimeout(r, 2));
+    }
+    read++;
+    // awaited, so a caller can use this to drain its own encoder queue
+    if (onTick && (read & 15) === 0) await onTick();
+    if (onProgress && (read & 127) === 0 && dm.total) onProgress(read / dm.total);
+  });
+  await dec.flush();
+  dec.close();
+  if (failure) throw failure;
+  return { sampleRate: cfg.sampleRate, channels: channels };
+}
+
+/** Load-time analysis with no ffmpeg involved at all. */
+async function analyseWithWebCodecs(file, onProgress) {
+  const probe = await openDemuxer(file, 'audio');
+  const rate = probe.track.audio.sample_rate;
+  const an = new Analyser(rate);
+  const info = await decodeAudioTrack(file, (chans, n) => an.push(chans, n), onProgress);
+  const done = an.finish();
+  if (!done.samples) throw new Error('the audio track decoded to nothing');
+  return {
+    frameDb: done.frameDb,
+    env: done.env,
+    sampleRate: info.sampleRate,
+    channels: info.channels,
+    duration: done.samples / info.sampleRate
+  };
+}
+
 /** Cut + level the audio with ffmpeg (audio only, so it's quick) -> AudioBuffer. */
 async function buildAudioTrack(keep, levelKey, wantLufs, inName) {
   const parts = [];
@@ -946,6 +1124,109 @@ async function buildAudioTrack(keep, levelKey, wantLufs, inName) {
   actx.close();
   await ffmpeg.deleteFile('cut.wav');
   return audio;
+}
+
+/* Cut, level and encode the audio in one streaming pass.
+
+   The keep-ranges are applied in sample space, the levelling is the JS chain
+   in cutdown-audio.js, and each block goes straight to the AAC encoder — so
+   nothing bigger than a decoded block is ever held. */
+/** Encode an already-finished AudioBuffer (the ffmpeg LUFS route). */
+async function encodeAudioBuffer(muxer, audio, rate, channels) {
+  const aacCfg = { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 160000 };
+  if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) throw new Error('no AAC encoder');
+  let failure = null;
+  const enc = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: e => { failure = e; }
+  });
+  enc.configure(aacCfg);
+
+  const FRAME = 1024;
+  const chData = [];
+  for (let c = 0; c < channels; c++) chData.push(audio.getChannelData(Math.min(c, audio.numberOfChannels - 1)));
+  const planar = new Float32Array(FRAME * channels);
+  for (let off = 0; off < audio.length; off += FRAME) {
+    const n = Math.min(FRAME, audio.length - off);
+    for (let c = 0; c < channels; c++) planar.set(chData[c].subarray(off, off + n), c * n);
+    enc.encode(new AudioData({
+      format: 'f32-planar', sampleRate: rate, numberOfFrames: n,
+      numberOfChannels: channels, timestamp: Math.round((off / rate) * 1e6),
+      data: planar.subarray(0, n * channels)
+    }));
+    if (enc.encodeQueueSize > 32) await new Promise(r => setTimeout(r, 0));
+  }
+  await enc.flush();
+  enc.close();
+  if (failure) throw failure;
+}
+
+async function encodeAudioPass(muxer, keep, levelKey, rate, channels, onProgress) {
+  const aacCfg = { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 160000 };
+  if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) throw new Error('no AAC encoder');
+
+  let failure = null;
+  const enc = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: e => { failure = e; }
+  });
+  enc.configure(aacCfg);
+
+  const lev = new window.CutdownAudio.Leveller(rate, channels, levelKey);
+  let outPos = 0;
+  // The decoder hands us blocks from a callback we cannot await inside, so
+  // they queue here and go to the encoder from the awaitable tick instead.
+  let queued = [];
+  const emit = blocks => { for (const b of blocks) if (b[0].length) queued.push(b); };
+  const drain = async () => {
+    while (queued.length) {
+      const batch = queued;
+      queued = [];
+      for (const b of batch) {
+        const n = b[0].length;
+        const planar = new Float32Array(n * channels);
+        for (let c = 0; c < channels; c++) planar.set(b[c], c * n);
+        enc.encode(new AudioData({
+          format: 'f32-planar', sampleRate: rate, numberOfFrames: n,
+          numberOfChannels: channels, timestamp: Math.round((outPos / rate) * 1e6),
+          data: planar
+        }));
+        outPos += n;
+      }
+      if (enc.encodeQueueSize > 32) {
+        await new Promise(r => setTimeout(r, 0));
+        while (enc.encodeQueueSize > 16) await new Promise(r => setTimeout(r, 2));
+      }
+    }
+  };
+
+  // keep-ranges in samples, walked in step with the decoder
+  const ranges = keep.map(r => [Math.round(r[0] * rate), Math.round(r[1] * rate)]);
+  let first = 0, pos = 0;
+
+  await decodeAudioTrack(state.file, (chans, n) => {
+    if (failure) return;
+    const p0 = pos, p1 = pos + n;
+    pos = p1;
+    while (first < ranges.length && ranges[first][1] <= p0) first++;
+    for (let k = first; k < ranges.length && ranges[k][0] < p1; k++) {
+      const a = Math.max(p0, ranges[k][0]), b = Math.min(p1, ranges[k][1]);
+      if (b <= a) continue;
+      const slice = [];
+      for (let c = 0; c < channels; c++) {
+        // a mono source feeds both output channels
+        slice.push(chans[Math.min(c, chans.length - 1)].subarray(a - p0, b - p0));
+      }
+      emit(lev.push(slice, b - a));
+    }
+  }, onProgress, drain);
+
+  emit(lev.flush());
+  await drain();
+  await enc.flush();
+  enc.close();
+  if (failure) throw failure;
+  return outPos;
 }
 
 async function processFast(onProgress, sink) {
@@ -975,8 +1256,18 @@ async function processFast(onProgress, sink) {
     throw new Error('browser cannot decode ' + track.codec);
   }
 
-  onProgress(0.05, 'Levelling the audio…');
-  const audio = await buildAudioTrack(keep, state.level, ctrl.lufs.checked, inName);
+  // Matching a LUFS target is the one thing still done by ffmpeg, so ticking
+  // it brings the old whole-file-in-memory route back with it.
+  const wantLufs = ctrl.lufs.checked;
+  let legacyAudio = null;
+  if (wantLufs) {
+    onProgress(0.05, 'Levelling the audio…');
+    await ensureFFmpegInput();
+    legacyAudio = await buildAudioTrack(keep, state.level, true, inName);
+  }
+  const aRate = legacyAudio ? legacyAudio.sampleRate : state.audioRate;
+  const aChannels = Math.min(2, legacyAudio ? legacyAudio.numberOfChannels : state.audioChannels);
+  if (!aRate || !aChannels) throw new Error('no audio track to work with');
 
   // Streaming to disk means the moov box lands at the end of the file rather
   // than the front; for a local file that costs nothing, and it is what lets
@@ -988,10 +1279,17 @@ async function processFast(onProgress, sink) {
   const muxer = new window.Mp4Muxer.Muxer({
     target,
     video: { codec: 'avc', width, height },
-    audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: Math.min(2, audio.numberOfChannels) },
+    audio: { codec: 'aac', sampleRate: aRate, numberOfChannels: aChannels },
     fastStart: sink ? false : 'in-memory',
     firstTimestampBehavior: 'offset'
   });
+
+  // ---- audio ----
+  if (!legacyAudio) {
+    onProgress(0.05, 'Levelling the audio…');
+    await encodeAudioPass(muxer, keep, state.level, aRate, aChannels,
+      p => onProgress(0.05 + 0.03 * p, 'Levelling the audio…'));
+  }
 
   // ---- video ----
   let encoded = 0, decoded = 0, lastIdx = -1;
@@ -1042,37 +1340,12 @@ async function processFast(onProgress, sink) {
   decoder.close();
   encoder.close();
 
-  // ---- audio ----
-  onProgress(0.92, 'Encoding audio…');
-  const channels = Math.min(2, audio.numberOfChannels);
-  const aacCfg = { codec: 'mp4a.40.2', sampleRate: audio.sampleRate, numberOfChannels: channels, bitrate: 160000 };
-  if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) {
-    throw new Error('no AAC encoder');
+  // The LUFS route produced a finished AudioBuffer rather than streaming, so
+  // it is encoded here at the end instead.
+  if (legacyAudio) {
+    onProgress(0.92, 'Encoding audio…');
+    await encodeAudioBuffer(muxer, legacyAudio, aRate, aChannels);
   }
-  const aEnc = new AudioEncoder({
-    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-    error: e => { throw e; }
-  });
-  aEnc.configure(aacCfg);
-
-  const FRAME = 1024;
-  const inter = new Float32Array(FRAME * channels);
-  const chData = [];
-  for (let c = 0; c < channels; c++) chData.push(audio.getChannelData(c));
-  for (let off = 0; off < audio.length; off += FRAME) {
-    const n = Math.min(FRAME, audio.length - off);
-    for (let i = 0; i < n; i++) {
-      for (let c = 0; c < channels; c++) inter[i * channels + c] = chData[c][off + i];
-    }
-    aEnc.encode(new AudioData({
-      format: 'f32', sampleRate: audio.sampleRate, numberOfFrames: n,
-      numberOfChannels: channels, timestamp: Math.round((off / audio.sampleRate) * 1e6),
-      data: inter.subarray(0, n * channels)
-    }));
-    if (aEnc.encodeQueueSize > 32) await new Promise(r => setTimeout(r, 0));
-  }
-  await aEnc.flush();
-  aEnc.close();
 
   muxer.finalize();
 

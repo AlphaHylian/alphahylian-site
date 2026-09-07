@@ -250,6 +250,8 @@
             <button type="button" data-v="hard">Aggressive</button>
           </div>
           <label class="cd-check"><input type="checkbox" id="cd-lufs"> Also match −16 LUFS (YouTube target)</label>
+          <div class="cd-hint">This one still needs the software engine, which loads the whole
+            recording into memory. Leave it off for very long videos — YouTube normalises anyway.</div>
         </div>
 
         <div class="cd-group">
@@ -300,8 +302,9 @@
   </div>
 
   <p class="cd-note">Everything happens locally — the video never leaves your computer.
-    MP4 and MOV use your browser&rsquo;s own video encoder and go quickly; other formats fall back
-    to a slower software encoder. Keep the tab open while it works.</p>
+    MP4 and MOV are handled entirely by your browser&rsquo;s own encoder and stream through a
+    piece at a time, so length is not really a limit; other formats fall back to a slower
+    software encoder that needs the whole file in memory. Keep the tab open while it works.</p>
 </div>
 
 <!-- served from our own origin: ffmpeg.wasm spawns a Worker, and a Worker
@@ -310,6 +313,8 @@
 <!-- demuxer + muxer for the fast WebCodecs path -->
 <script src="/vendor/mp4box.all.min.js"></script>
 <script src="/vendor/mp4-muxer.min.js"></script>
+<!-- levelling chain; also loadable in node, which is how it was tuned -->
+<script src="/cutdown-audio.js"></script>
 <script src="/cutdown.js"></script>
 </body>
 </html>

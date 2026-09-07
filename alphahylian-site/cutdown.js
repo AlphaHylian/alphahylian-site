@@ -56,6 +56,11 @@ const LUFS_TARGET = -16;
 const LUFS_LIMIT = 0.841;
 const LUFS_MAX_PASSES = 4;
 const LUFS_TOLERANCE = 0.1;
+
+// How speech-like a hop has to look before it counts as worth keeping. Set
+// from the fixture in cutdown-audio.js: at this value 99.6% of speech hops
+// survive while keyboard clatter and a low explosion are cut entirely.
+const SPEECH_THRESHOLD = 0.35;
 const MIN_CLIP = 0.12;     // seconds; drop keep-ranges shorter than this
 const HOP_SECONDS = 0.02;  // analysis window
 
@@ -96,6 +101,7 @@ const ctrl = {
   min: el('cd-min'), minV: el('cd-min-v'),
   pad: el('cd-pad'), padV: el('cd-pad-v'),
   level: el('cd-level'), lufs: el('cd-lufs'),
+  speech: el('cd-speech'),
   quality: el('cd-quality')
 };
 
@@ -105,6 +111,7 @@ const state = {
   ext: 'mp4',
   duration: 0,
   env: null,          // Float32Array of per-hop peaks — all the waveform needs
+  speech: null,       // Float32Array of per-hop 0..1 speech likelihood
   waveGain: 1,        // display-only scale so quiet recordings still show up
   audioRate: 0,       // source audio rate/channels, kept for the encoder
   audioChannels: 0,
@@ -185,15 +192,21 @@ async function loadFFmpeg(onNote) {
  * Turn the dB envelope into ranges worth keeping.
  * threshold dBFS, minSilence/pad in seconds.
  */
-function findKeep(frameDb, threshold, minSilence, pad, duration) {
+function findKeep(frameDb, threshold, minSilence, pad, duration, speech) {
   const n = frameDb.length;
   if (!n) return [[0, duration]];
   const hop = HOP_SECONDS;
   const minSilenceFrames = Math.max(1, Math.round(minSilence / hop));
 
-  // 1. loud / quiet per frame
+  // 1. worth keeping / not, per frame. Loud enough is necessary but not
+  //    sufficient: when the speech test is on, a frame also has to look like
+  //    someone talking, or a slammed door survives the cut just as well as a
+  //    sentence does.
   const loud = new Uint8Array(n);
-  for (let i = 0; i < n; i++) loud[i] = frameDb[i] > threshold ? 1 : 0;
+  for (let i = 0; i < n; i++) {
+    loud[i] = (frameDb[i] > threshold &&
+               (!speech || speech[i] > SPEECH_THRESHOLD)) ? 1 : 0;
+  }
 
   // 2. A quiet run shorter than the minimum isn't worth cutting — fill it in,
   //    which is what keeps natural breaths and beats between words.
@@ -289,6 +302,9 @@ function Analyser(sampleRate) {
   this.db = [];
   this.env = [];
   this.total = 0;
+  // fed the same stream, hop for hop, so its output lines up with db/env
+  this.speech = new window.CutdownAudio.SpeechFeatures(sampleRate, this.hop);
+  this.mono = null;
 }
 
 Analyser.prototype._closeHop = function () {
@@ -300,15 +316,25 @@ Analyser.prototype._closeHop = function () {
 
 Analyser.prototype.push = function (chans, count) {
   const ch = chans.length;
+  if (!this.mono || this.mono.length < count) this.mono = new Float32Array(count);
+  const mono = this.mono;
+  if (ch === 1) {
+    mono.set(chans[0].subarray(0, count));
+  } else {
+    for (let i = 0; i < count; i++) {
+      let v = 0;
+      for (let c = 0; c < ch; c++) v += chans[c][i];
+      mono[i] = v / ch;
+    }
+  }
   for (let i = 0; i < count; i++) {
-    let v = 0;
-    for (let c = 0; c < ch; c++) v += chans[c][i];
-    v /= ch;
+    const v = mono[i];
     const a = v < 0 ? -v : v;
     if (a > this.peak) this.peak = a;
     this.sum += v * v;
     if (++this.n === this.hop) this._closeHop();
   }
+  this.speech.push(mono, count);
   this.total += count;
 };
 
@@ -320,7 +346,13 @@ Analyser.prototype.finish = function () {
     this.db.push(rms > 1e-7 ? 20 * Math.log10(rms) : -120);
     this.env.push(this.peak);
   }
-  return { frameDb: Float32Array.from(this.db), env: Float32Array.from(this.env), samples: this.total };
+  const frameDb = Float32Array.from(this.db);
+  return {
+    frameDb: frameDb,
+    env: Float32Array.from(this.env),
+    speech: window.CutdownAudio.speechScores(frameDb, this.speech.finish()),
+    samples: this.total
+  };
 };
 
 function drawWave() {
@@ -430,12 +462,23 @@ function recompute() {
   const thr = parseFloat(ctrl.thr.value);
   const min = parseFloat(ctrl.min.value);
   const pad = parseFloat(ctrl.pad.value);
-  state.keep = findKeep(state.frameDb, thr, min, pad, state.duration);
+  const useSpeech = ctrl.speech.checked && state.speech;
+  state.keep = findKeep(state.frameDb, thr, min, pad, state.duration,
+                        useSpeech ? state.speech : null);
   renderStats();
   drawWave();
 
   const cap = (fastPathPossible() && state.audioRate > 0) ? MAX_SEGMENTS_FAST : MAX_SEGMENTS;
-  if (state.keep.length > cap) {
+  if (!state.keep.length) {
+    // Silently producing nothing is the worst outcome, and with the speech
+    // test on it is the likely one for material that isn't talking.
+    showError(useSpeech
+      ? 'Nothing here looks like speech, so everything would be cut. Untick ' +
+        '“Keep only speech” if this recording is music or effects.'
+      : 'Nothing is above the silence threshold, so everything would be cut. ' +
+        'Try lowering it.');
+    goEl.disabled = true;
+  } else if (state.keep.length > cap) {
     showError(`That produces ${state.keep.length} separate clips, which is more than ` +
       `Cutdown will stitch in one pass. Raise "min silence to cut" a little.`);
     goEl.disabled = true;
@@ -480,6 +523,7 @@ async function handleFile(file) {
         });
         state.frameDb = a.frameDb;
         state.env = a.env;
+        state.speech = a.speech;
         state.audioRate = a.sampleRate;
         state.audioChannels = a.channels;
         state.duration = a.duration;
@@ -520,6 +564,7 @@ async function handleFile(file) {
       const done = an.finish();
       state.frameDb = done.frameDb;
       state.env = done.env;
+      state.speech = done.speech;
       state.duration = audio.duration;
       state.waveGain = waveGainFor(done.env);
 
@@ -765,6 +810,12 @@ fileEl.addEventListener('change', () => handleFile(fileEl.files && fileEl.files[
     autoNoteEl.textContent = '';
     recompute();
   });
+});
+
+// the scores are already computed, so this redraws instantly like the sliders
+ctrl.speech.addEventListener('change', () => {
+  autoNoteEl.textContent = '';
+  recompute();
 });
 
 function wireSegmented(group, onPick) {
@@ -1119,6 +1170,7 @@ async function analyseWithWebCodecs(file, onProgress) {
   return {
     frameDb: done.frameDb,
     env: done.env,
+    speech: done.speech,
     sampleRate: info.sampleRate,
     channels: info.channels,
     duration: done.samples / info.sampleRate

@@ -263,6 +263,126 @@
     return out;
   };
 
+  /* --------------------------------------------------- speech detection
+
+     Loudness alone cannot tell talking from a door slamming, and the whole
+     point of the tool is to keep the talking. These are the cheap per-hop
+     features that actually separate the two, measured on a fixture of
+     synthesised speech cut with keyboard clatter, a low explosion and game
+     music (all of it louder than the speech):
+
+                     speech   keyboard  explosion  music
+       band 300-3400   0.55     0.38      0.21      0.74   of total energy
+       low  <250 Hz    0.66     0.09      0.97      0.57
+       zero crossings  0.050    0.326     0.004     0.015
+       level movement 11.3      41.6      5.4       1.5    dB over ~0.4 s
+
+     Every one of those confusions is broken by a different feature, so the
+     score is the weakest of four soft tests rather than a sum: a clatter is
+     rejected on zero crossings, a rumble on its low end, steady music on the
+     fact that it does not move the way syllables do.
+     ------------------------------------------------------------------- */
+
+  /** RBJ cookbook low/high pass, as plain coefficients for Biquad. */
+  function makeBiquad(type, f0, rate, Q) {
+    const w = 2 * Math.PI * f0 / rate, cw = Math.cos(w), sw = Math.sin(w), al = sw / (2 * Q);
+    let b0, b1, b2;
+    if (type === 'lp') { b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = b0; }
+    else { b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = b0; }
+    const a0 = 1 + al;
+    return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: -2 * cw / a0, a2: (1 - al) / a0 };
+  }
+
+  /** 1 inside [lo,hi], falling to 0 over `soft` beyond it. */
+  function softBand(v, lo, hi, soft) {
+    if (v >= lo && v <= hi) return 1;
+    const d = v < lo ? lo - v : v - hi;
+    return d >= soft ? 0 : 1 - d / soft;
+  }
+
+  function SpeechFeatures(sampleRate, hop) {
+    this.hop = hop;
+    this.hp = new Biquad(makeBiquad('hp', 300, sampleRate, 0.707));
+    this.lp = new Biquad(makeBiquad('lp', 3400, sampleRate, 0.707));
+    this.low = new Biquad(makeBiquad('lp', 250, sampleRate, 0.707));
+    this.sum = 0; this.sumBand = 0; this.sumLow = 0; this.cross = 0; this.n = 0;
+    this.prev = 0;
+    this.bandR = []; this.lowR = []; this.zcr = [];
+  }
+
+  SpeechFeatures.prototype._close = function () {
+    const rms = Math.sqrt(this.sum / this.n);
+    if (rms > 1e-6) {
+      this.bandR.push(Math.sqrt(this.sumBand / this.n) / rms);
+      this.lowR.push(Math.sqrt(this.sumLow / this.n) / rms);
+    } else {
+      this.bandR.push(0); this.lowR.push(0);
+    }
+    this.zcr.push(this.cross / this.n);
+    this.sum = 0; this.sumBand = 0; this.sumLow = 0; this.cross = 0; this.n = 0;
+  };
+
+  /** Feed a block of mono samples. */
+  SpeechFeatures.prototype.push = function (mono, count) {
+    for (let i = 0; i < count; i++) {
+      const v = mono[i];
+      const b = this.lp.run(this.hp.run(v));
+      const l = this.low.run(v);
+      this.sum += v * v;
+      this.sumBand += b * b;
+      this.sumLow += l * l;
+      if ((v < 0) !== (this.prev < 0)) this.cross++;
+      this.prev = v;
+      if (++this.n === this.hop) this._close();
+    }
+  };
+
+  SpeechFeatures.prototype.finish = function () {
+    if (this.n > 0) this._close();
+    return { bandR: this.bandR, lowR: this.lowR, zcr: this.zcr };
+  };
+
+  /* How much the level moves around each hop — the syllable rhythm that
+     separates someone talking from a sustained noise. */
+  function levelMovement(frameDb, halfWindow) {
+    const n = frameDb.length, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - halfWindow), b = Math.min(n, i + halfWindow + 1);
+      let mean = 0;
+      for (let k = a; k < b; k++) mean += frameDb[k];
+      mean /= (b - a);
+      let v = 0;
+      for (let k = a; k < b; k++) { const d = frameDb[k] - mean; v += d * d; }
+      out[i] = Math.sqrt(v / (b - a));
+    }
+    return out;
+  }
+
+  /** Per-hop 0..1 likelihood that this is someone talking. */
+  function speechScores(frameDb, feat) {
+    const n = frameDb.length;
+    const mov = levelMovement(frameDb, 10);          // +/- 0.2 s
+    const raw = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      raw[i] = Math.min(
+        softBand(feat.bandR[i], 0.35, 1.0, 0.15),
+        softBand(feat.lowR[i], 0.0, 0.85, 0.10),
+        softBand(feat.zcr[i], 0.010, 0.20, 0.06),
+        softBand(mov[i], 4.0, 1e9, 3.0)
+      );
+    }
+    // Speech arrives in runs, so smooth over ~a quarter second: one awkward
+    // hop in the middle of a word should not punch a hole in it.
+    const S = 6, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - S), b = Math.min(n, i + S + 1);
+      let m = 0;
+      for (let k = a; k < b; k++) m += raw[k];
+      out[i] = m / (b - a);
+    }
+    return out;
+  }
+
   /* ------------------------------------------------------- loudness
 
      Integrated loudness to ITU-R BS.1770 / EBU R128, which is what "-16 LUFS"
@@ -378,6 +498,7 @@
   };
 
   const api = { Leveller: Leveller, Limiter: Limiter, LoudnessMeter: LoudnessMeter,
+                SpeechFeatures: SpeechFeatures, speechScores: speechScores,
                 PRESETS: PRESETS, LIMIT: LIMIT };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CutdownAudio = api;

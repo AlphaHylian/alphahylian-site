@@ -605,12 +605,24 @@ async function process() {
   progEl.classList.add('on');
   barEl.style.width = '0%';
 
+  const started = performance.now();
+  let etaShown = 0;
   const onProgress = (p, label) => {
-    barEl.style.width = (Math.max(0, Math.min(1, p)) * 100).toFixed(1) + '%';
-    plabelEl.textContent = `${label} ${Math.round(p * 100)}%`;
+    p = Math.max(0, Math.min(1, p));
+    barEl.style.width = (p * 100).toFixed(1) + '%';
+    // A long recording is a long wait, and a bare percentage doesn't tell you
+    // whether to sit there or go and do something else. Held for a couple of
+    // seconds at a time so it doesn't flicker between every frame.
+    const elapsed = (performance.now() - started) / 1000;
+    let eta = '';
+    if (p > 0.05 && elapsed > 4) {
+      const now = performance.now();
+      if (now - etaShown > 2000) { etaShown = now; onProgress.left = elapsed * (1 - p) / p; }
+      if (onProgress.left != null) eta = ` · about ${fmtTime(onProgress.left)} left`;
+    }
+    plabelEl.textContent = `${label} ${Math.round(p * 100)}%${eta}`;
   };
 
-  const started = performance.now();
   let blob = null, engine = '', savedTo = null;
 
   // The fast path needs an MP4/MOV the browser can decode; everything else
@@ -624,7 +636,10 @@ async function process() {
         const r = await processFast(onProgress, sink);
         blob = r.blob;
         savedTo = r.savedTo || null;
-        engine = `browser encoder · ${r.stats.decoded} frames read, ${r.stats.encoded} kept`;
+        const secs = (performance.now() - started) / 1000;
+        const rate = secs > 0 ? Math.round(r.stats.decoded / secs) : 0;
+        engine = `browser encoder · ${r.stats.decoded} frames read, ${r.stats.encoded} kept` +
+                 (rate ? ` · ${rate} fps` : '');
       } catch (err) {
         console.warn('[cutdown] fast path unavailable, falling back to ffmpeg:', err);
         engineEl.textContent = 'Browser encoder could not handle this file (' +

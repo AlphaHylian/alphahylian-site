@@ -46,6 +46,16 @@ const QUALITY = {
 // so it only needs a limit loose enough to catch a runaway setting.
 const MAX_SEGMENTS = 400;
 const MAX_SEGMENTS_FAST = 20000;
+
+// Loudness target for the "-16 LUFS" option, with the -1.5 dBFS true-peak
+// allowance that goes with it. The limiter is doing real gain reduction by the
+// time audio reaches it, so loudness doesn't respond linearly to a gain change
+// and the correction has to be iterated; it converges from below in three or
+// four passes, and we stop early once it is within a tenth of a dB.
+const LUFS_TARGET = -16;
+const LUFS_LIMIT = 0.841;
+const LUFS_MAX_PASSES = 4;
+const LUFS_TOLERANCE = 0.1;
 const MIN_CLIP = 0.12;     // seconds; drop keep-ranges shorter than this
 const HOP_SECONDS = 0.02;  // analysis window
 
@@ -1115,68 +1125,60 @@ async function analyseWithWebCodecs(file, onProgress) {
   };
 }
 
-/** Cut + level the audio with ffmpeg (audio only, so it's quick) -> AudioBuffer. */
-async function buildAudioTrack(keep, levelKey, wantLufs, inName) {
-  const parts = [];
-  keep.forEach(([s, e], i) => {
-    parts.push(`[0:a]atrim=${s.toFixed(3)}:${e.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
-  });
-  parts.push(`${keep.map((_, i) => `[a${i}]`).join('')}concat=n=${keep.length}:v=0:a=1[araw]`);
-  const chain = [];
-  if (LEVELS[levelKey]) chain.push(LEVELS[levelKey]);
-  if (wantLufs) chain.push(LOUDNORM);
-  if (chain.length) parts.push(`[araw]${chain.join(',')}[aout]`);
-
-  await ffmpeg.exec([
-    '-i', inName,
-    '-filter_complex', parts.join(';'),
-    '-map', chain.length ? '[aout]' : '[araw]',
-    '-ac', '2', '-ar', '48000', '-c:a', 'pcm_s16le', 'cut.wav'
-  ]);
-  const wav = await ffmpeg.readFile('cut.wav');
-  const actx = new (window.AudioContext || window.webkitAudioContext)();
-  const audio = await actx.decodeAudioData(wav.buffer.slice(0));
-  actx.close();
-  await ffmpeg.deleteFile('cut.wav');
-  return audio;
-}
-
 /* Cut, level and encode the audio in one streaming pass.
 
    The keep-ranges are applied in sample space, the levelling is the JS chain
    in cutdown-audio.js, and each block goes straight to the AAC encoder — so
    nothing bigger than a decoded block is ever held. */
-/** Encode an already-finished AudioBuffer (the ffmpeg LUFS route). */
-async function encodeAudioBuffer(muxer, audio, rate, channels) {
-  const aacCfg = { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 160000 };
-  if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) throw new Error('no AAC encoder');
-  let failure = null;
-  const enc = new AudioEncoder({
-    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-    error: e => { failure = e; }
-  });
-  enc.configure(aacCfg);
 
-  const FRAME = 1024;
-  const chData = [];
-  for (let c = 0; c < channels; c++) chData.push(audio.getChannelData(Math.min(c, audio.numberOfChannels - 1)));
-  const planar = new Float32Array(FRAME * channels);
-  for (let off = 0; off < audio.length; off += FRAME) {
-    const n = Math.min(FRAME, audio.length - off);
-    for (let c = 0; c < channels; c++) planar.set(chData[c].subarray(off, off + n), c * n);
-    enc.encode(new AudioData({
-      format: 'f32-planar', sampleRate: rate, numberOfFrames: n,
-      numberOfChannels: channels, timestamp: Math.round((off / rate) * 1e6),
-      data: planar.subarray(0, n * channels)
-    }));
-    if (enc.encodeQueueSize > 32) await new Promise(r => setTimeout(r, 0));
-  }
-  await enc.flush();
-  enc.close();
-  if (failure) throw failure;
+/* Decode -> cut -> level, handing each finished block to `onBlocks`.
+   Used twice: once to measure loudness, once to encode. */
+async function runAudioChain(keep, rate, channels, levelKey, opts, onBlocks, onProgress, onTick) {
+  const lev = new window.CutdownAudio.Leveller(rate, channels, levelKey, opts);
+  const ranges = keep.map(r => [Math.round(r[0] * rate), Math.round(r[1] * rate)]);
+  let first = 0, pos = 0;
+
+  await decodeAudioTrack(state.file, (chans, n) => {
+    const p0 = pos, p1 = pos + n;
+    pos = p1;
+    while (first < ranges.length && ranges[first][1] <= p0) first++;
+    for (let k = first; k < ranges.length && ranges[k][0] < p1; k++) {
+      const a = Math.max(p0, ranges[k][0]), b = Math.min(p1, ranges[k][1]);
+      if (b <= a) continue;
+      const slice = [];
+      for (let c = 0; c < channels; c++) {
+        // a mono source feeds both output channels
+        slice.push(chans[Math.min(c, chans.length - 1)].subarray(a - p0, b - p0));
+      }
+      onBlocks(lev.push(slice, b - a));
+    }
+  }, onProgress, onTick);
+
+  onBlocks(lev.flush());
 }
 
-async function encodeAudioPass(muxer, keep, levelKey, rate, channels, onProgress) {
+/** Integrated loudness of the cut + levelled audio at a given pre-gain. */
+async function measureLoudness(keep, rate, channels, levelKey, preGain, onProgress) {
+  const meter = new window.CutdownAudio.LoudnessMeter(rate, channels);
+  await runAudioChain(keep, rate, channels, levelKey, { preGain: preGain, limit: LUFS_LIMIT },
+    blocks => { for (const b of blocks) meter.push(b, b[0].length); }, onProgress);
+  return meter.integrated();
+}
+
+/** Work out the pre-gain that lands the finished audio on the LUFS target. */
+async function solveLufsGain(keep, rate, channels, levelKey, onProgress) {
+  let gain = 1;
+  for (let pass = 0; pass < LUFS_MAX_PASSES; pass++) {
+    const measured = await measureLoudness(keep, rate, channels, levelKey, gain,
+      p => onProgress((pass + p) / LUFS_MAX_PASSES));
+    if (measured == null) return 1;              // nothing above the gate
+    if (Math.abs(measured - LUFS_TARGET) < LUFS_TOLERANCE) break;
+    gain *= Math.pow(10, (LUFS_TARGET - measured) / 20);
+  }
+  return gain;
+}
+
+async function encodeAudioPass(muxer, keep, levelKey, rate, channels, wantLufs, onProgress) {
   const aacCfg = { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 160000 };
   if (!(await AudioEncoder.isConfigSupported(aacCfg)).supported) throw new Error('no AAC encoder');
 
@@ -1187,7 +1189,6 @@ async function encodeAudioPass(muxer, keep, levelKey, rate, channels, onProgress
   });
   enc.configure(aacCfg);
 
-  const lev = new window.CutdownAudio.Leveller(rate, channels, levelKey);
   let outPos = 0;
   // The decoder hands us blocks from a callback we cannot await inside, so
   // they queue here and go to the encoder from the awaitable tick instead.
@@ -1215,28 +1216,18 @@ async function encodeAudioPass(muxer, keep, levelKey, rate, channels, onProgress
     }
   };
 
-  // keep-ranges in samples, walked in step with the decoder
-  const ranges = keep.map(r => [Math.round(r[0] * rate), Math.round(r[1] * rate)]);
-  let first = 0, pos = 0;
+  // Matching a loudness target needs the finished audio measured first, so
+  // that runs as its own pass (or three) before the one that encodes.
+  let preGain = 1, limit = window.CutdownAudio.LIMIT;
+  if (wantLufs) {
+    limit = LUFS_LIMIT;
+    preGain = await solveLufsGain(keep, rate, channels, levelKey,
+      p => onProgress(p, 'Matching loudness…'));
+  }
 
-  await decodeAudioTrack(state.file, (chans, n) => {
-    if (failure) return;
-    const p0 = pos, p1 = pos + n;
-    pos = p1;
-    while (first < ranges.length && ranges[first][1] <= p0) first++;
-    for (let k = first; k < ranges.length && ranges[k][0] < p1; k++) {
-      const a = Math.max(p0, ranges[k][0]), b = Math.min(p1, ranges[k][1]);
-      if (b <= a) continue;
-      const slice = [];
-      for (let c = 0; c < channels; c++) {
-        // a mono source feeds both output channels
-        slice.push(chans[Math.min(c, chans.length - 1)].subarray(a - p0, b - p0));
-      }
-      emit(lev.push(slice, b - a));
-    }
-  }, onProgress, drain);
+  await runAudioChain(keep, rate, channels, levelKey, { preGain: preGain, limit: limit },
+    emit, onProgress, drain);
 
-  emit(lev.flush());
   await drain();
   await enc.flush();
   enc.close();
@@ -1271,17 +1262,9 @@ async function processFast(onProgress, sink) {
     throw new Error('browser cannot decode ' + track.codec);
   }
 
-  // Matching a LUFS target is the one thing still done by ffmpeg, so ticking
-  // it brings the old whole-file-in-memory route back with it.
   const wantLufs = ctrl.lufs.checked;
-  let legacyAudio = null;
-  if (wantLufs) {
-    onProgress(0.05, 'Levelling the audio…');
-    await ensureFFmpegInput();
-    legacyAudio = await buildAudioTrack(keep, state.level, true, inName);
-  }
-  const aRate = legacyAudio ? legacyAudio.sampleRate : state.audioRate;
-  const aChannels = Math.min(2, legacyAudio ? legacyAudio.numberOfChannels : state.audioChannels);
+  const aRate = state.audioRate;
+  const aChannels = Math.min(2, state.audioChannels);
   if (!aRate || !aChannels) throw new Error('no audio track to work with');
 
   // Streaming to disk means the moov box lands at the end of the file rather
@@ -1300,11 +1283,11 @@ async function processFast(onProgress, sink) {
   });
 
   // ---- audio ----
-  if (!legacyAudio) {
-    onProgress(0.05, 'Levelling the audio…');
-    await encodeAudioPass(muxer, keep, state.level, aRate, aChannels,
-      p => onProgress(0.05 + 0.03 * p, 'Levelling the audio…'));
-  }
+  // Loudness matching costs extra passes over the audio, so it gets a wider
+  // slice of the progress bar when it is on.
+  const audioShare = wantLufs ? 0.20 : 0.03;
+  await encodeAudioPass(muxer, keep, state.level, aRate, aChannels, wantLufs,
+    (p, label) => onProgress(0.05 + audioShare * p, label || 'Levelling the audio…'));
 
   // ---- video ----
   let encoded = 0, decoded = 0, lastIdx = -1;
@@ -1347,20 +1330,13 @@ async function processFast(onProgress, sink) {
         await new Promise(r => setTimeout(r, 4));
       }
     }
-    if ((read & 63) === 0) onProgress(0.08 + 0.82 * (read / total), 'Cutting video…');
+    if ((read & 63) === 0) onProgress(0.05 + audioShare + (0.92 - audioShare) * (read / total), 'Cutting video…');
     read++;
   });
   await decoder.flush();
   await encoder.flush();
   decoder.close();
   encoder.close();
-
-  // The LUFS route produced a finished AudioBuffer rather than streaming, so
-  // it is encoded here at the end instead.
-  if (legacyAudio) {
-    onProgress(0.92, 'Encoding audio…');
-    await encodeAudioBuffer(muxer, legacyAudio, aRate, aChannels);
-  }
 
   muxer.finalize();
 

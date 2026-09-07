@@ -636,6 +636,7 @@ function dragMove(e){
     }
     dragArmed = false;
     lookMode = 'dragging';
+    punchTurnStart = -1;
   }
   const dx = p.x - lastPointerX;
   const dy = p.y - lastPointerY;
@@ -669,9 +670,36 @@ const HIT_PERIOD = (2 * Math.PI / 18) / HIT_SPEED;    // exactly one full swing
 let hitAnim = null;
 let punchId = null;
 
+/* ---- turn into the punch ----
+   Tracking normally leaves the body square on and lets the head do the
+   looking, which means a punch aimed off to one side swings across the
+   model's own chest. For the length of the swing the body comes round to
+   face the cursor properly, then eases back to the resting pose. */
+const PUNCH_TURN_IN = 0.09;         // seconds to come round
+const PUNCH_TURN_HOLD = HIT_PERIOD; // stay facing while the arm is out
+const PUNCH_TURN_OUT = 0.45;        // and unwind
+const PUNCH_TURN_SPEED = 0.3;
+let punchTurnStart = -1;
+
+/** 0 normally, 1 while the punch is landing. */
+function punchTurnAmount(){
+  if(punchTurnStart < 0) return 0;
+  const t = Math.max(0, (performance.now() - punchTurnStart) / 1000);
+  if(t < PUNCH_TURN_IN){
+    const k = t / PUNCH_TURN_IN;
+    return k * k * (3 - 2 * k);
+  }
+  if(t < PUNCH_TURN_IN + PUNCH_TURN_HOLD) return 1;
+  const k = (t - PUNCH_TURN_IN - PUNCH_TURN_HOLD) / PUNCH_TURN_OUT;
+  if(k >= 1){ punchTurnStart = -1; return 0; }
+  const e = 1 - k;
+  return e * e * (3 - 2 * e);
+}
+
 function triggerPunch(){
   if(!viewer || !viewer.playerObject || !viewer.animation) return;
   if(punchId !== null) return;
+  punchTurnStart = performance.now();
   if(!hitAnim) hitAnim = new skinview3d.HitAnimation();
   const anim = viewer.animation;
 
@@ -799,10 +827,18 @@ function updateHeadLook(){
     } else {
       const { yaw: desiredYaw, pitch: desiredPitch } = lookTarget();
 
-      const overflowYaw = overflowPast(desiredYaw - bodyYaw, HEAD_SOFT_LIMIT);
-      const overflowPitch = overflowPast(desiredPitch - bodyPitch, HEAD_SOFT_LIMIT);
-      bodyYaw += overflowYaw * BODY_ASSIST_SPEED;
-      bodyPitch += overflowPitch * BODY_ASSIST_SPEED;
+      const turn = punchTurnAmount();
+      if(turn > 0){
+        // Blend from where the body would normally rest — square on, unless
+        // the head can't reach — all the way to facing the cursor head-on.
+        const rest = restingBody(desiredYaw);
+        const target = rest + (desiredYaw - rest) * turn;
+        bodyYaw += (target - bodyYaw) * PUNCH_TURN_SPEED;
+      } else {
+        bodyYaw += overflowPast(desiredYaw - bodyYaw, HEAD_SOFT_LIMIT) * BODY_ASSIST_SPEED;
+      }
+      // pitch is left alone: leaning into it reads as a stumble, not a punch
+      bodyPitch += overflowPast(desiredPitch - bodyPitch, HEAD_SOFT_LIMIT) * BODY_ASSIST_SPEED;
 
       const targetHeadYaw = Math.max(-HEAD_HARD_LIMIT, Math.min(HEAD_HARD_LIMIT, desiredYaw - bodyYaw));
       const targetHeadPitch = Math.max(-HEAD_HARD_LIMIT, Math.min(HEAD_HARD_LIMIT, desiredPitch - bodyPitch));

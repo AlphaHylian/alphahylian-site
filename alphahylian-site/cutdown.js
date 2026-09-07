@@ -95,6 +95,8 @@ const engineEl = el('cd-engine');
 const diskRowEl = el('cd-diskrow');
 const diskHintEl = el('cd-diskhint');
 const diskEl = el('cd-todisk');
+const srtEl = el('cd-srt');
+const vttEl = el('cd-vtt');
 
 const ctrl = {
   thr: el('cd-thr'), thrV: el('cd-thr-v'),
@@ -102,6 +104,7 @@ const ctrl = {
   pad: el('cd-pad'), padV: el('cd-pad-v'),
   level: el('cd-level'), lufs: el('cd-lufs'),
   speech: el('cd-speech'),
+  subs: el('cd-subs'),
   quality: el('cd-quality')
 };
 
@@ -120,6 +123,9 @@ const state = {
   keep: [],           // [[start,end], ...] seconds
   level: 'even',
   quality: 'normal',
+  subs: 'off',
+  srtUrl: null,
+  vttUrl: null,
   busy: false,
   preview: false,
   outUrl: null
@@ -497,6 +503,7 @@ async function handleFile(file) {
 
   state.file = file;
   state.ffInput = false;
+  setSubtitles(null);
   const dot = file.name.lastIndexOf('.');
   state.ext = dot > -1 ? file.name.slice(dot + 1).toLowerCase() : 'mp4';
   filenameEl.textContent = `${file.name} · ${fmtSize(file.size)}`;
@@ -723,6 +730,29 @@ async function process() {
       }
     }
 
+    // Subtitles come last: they need the same cuts the video just got, and
+    // running them first would make you wait for a transcript before finding
+    // out whether the encode even worked.
+    let cues = null;
+    if (state.subs !== 'off') {
+      if (!fastEligible) {
+        engineEl.textContent = engine +
+          ' · subtitles need an MP4 or MOV the browser can read, so they were skipped';
+      } else {
+        try {
+          cues = await transcribeCut(state.keep, state.audioRate,
+            Math.min(2, state.audioChannels), state.level, state.subs,
+            p => onProgress(0.95 + 0.05 * p, 'Transcribing…'),
+            note => { plabelEl.textContent = note; });
+        } catch (err) {
+          console.warn('[cutdown] transcription failed:', err);
+          engineEl.textContent = engine + ' · subtitles failed (' +
+            (err && err.message ? err.message : err) + ')';
+        }
+      }
+    }
+    setSubtitles(cues);
+
     if (state.outUrl) URL.revokeObjectURL(state.outUrl);
     state.outUrl = URL.createObjectURL(blob);
     outEl.src = state.outUrl;
@@ -829,6 +859,7 @@ function wireSegmented(group, onPick) {
 }
 wireSegmented(ctrl.level, v => { state.level = v; });
 wireSegmented(ctrl.quality, v => { state.quality = v; });
+wireSegmented(ctrl.subs, v => { state.subs = v; });
 
 goEl.addEventListener('click', process);
 resetEl.addEventListener('click', () => {
@@ -929,6 +960,19 @@ async function ensureFFmpegInput() {
   await loadFFmpeg(msg => { plabelEl.textContent = msg; });
   await ffmpeg.writeFile('input.' + state.ext, await fetchFile(state.file));
   state.ffInput = true;
+}
+
+function setSubtitles(cues) {
+  if (state.srtUrl) { URL.revokeObjectURL(state.srtUrl); state.srtUrl = null; }
+  if (state.vttUrl) { URL.revokeObjectURL(state.vttUrl); state.vttUrl = null; }
+  srtEl.hidden = vttEl.hidden = true;
+  if (!cues || !cues.length) return;
+
+  const base = state.file.name.replace(/\.[^.]+$/, '') + ' (cutdown)';
+  state.srtUrl = URL.createObjectURL(new Blob([toSrt(cues)], { type: 'text/plain' }));
+  state.vttUrl = URL.createObjectURL(new Blob([toVtt(cues)], { type: 'text/vtt' }));
+  srtEl.href = state.srtUrl; srtEl.download = base + '.srt'; srtEl.hidden = false;
+  vttEl.href = state.vttUrl; vttEl.download = base + '.vtt'; vttEl.hidden = false;
 }
 
 function diskSaveAvailable() {
@@ -1285,6 +1329,148 @@ async function encodeAudioPass(muxer, keep, levelKey, rate, channels, wantLufs, 
   enc.close();
   if (failure) throw failure;
   return outPos;
+}
+
+/* ---------------------------------------------------------- subtitles
+
+   Whisper, run locally through transformers.js. The audio it hears is the
+   audio that ends up in the file — cut and levelled — so its timestamps are
+   already in the finished video's timeline and need no correction.
+
+   It is fed in blocks rather than all at once, and the block boundaries are
+   put at the end of a keep-range, which is a silence by construction: split
+   in the middle of a sentence and you get the sentence twice, badly.
+   ------------------------------------------------------------------------ */
+
+const WHISPER_LIB = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js';
+const WHISPER_MODELS = { fast: 'Xenova/whisper-tiny.en', good: 'Xenova/whisper-base.en' };
+const SUBTITLE_BLOCK_SECONDS = 600;
+const WHISPER_RATE = 16000;
+
+let transcriber = null;
+let transcriberKey = '';
+
+async function loadTranscriber(quality, onNote) {
+  if (transcriber && transcriberKey === quality) return transcriber;
+  const { pipeline, env } = await import(WHISPER_LIB);
+  env.allowLocalModels = false;
+  const model = WHISPER_MODELS[quality] || WHISPER_MODELS.fast;
+
+  const build = device => pipeline('automatic-speech-recognition', model, {
+    dtype: 'q8',
+    device: device,
+    progress_callback: p => {
+      if (p.status === 'progress' && p.progress) {
+        onNote(`Downloading the speech model… ${Math.round(p.progress)}%`);
+      }
+    }
+  });
+
+  onNote('Loading the speech model…');
+  // Ask the GPU for an adapter before asking the runtime for a GPU backend.
+  // Trying webgpu first and catching the failure does not work: the runtime
+  // holds on to the dead backend and the retry fails the same way.
+  let device = 'wasm';
+  try {
+    if (navigator.gpu && await navigator.gpu.requestAdapter()) device = 'webgpu';
+  } catch (_) { /* no webgpu here */ }
+
+  try {
+    transcriber = await build(device);
+  } catch (err) {
+    if (device === 'wasm') throw err;
+    console.warn('[cutdown] webgpu backend failed, falling back to wasm:', err);
+    transcriber = await build('wasm');
+  }
+  transcriberKey = quality;
+  return transcriber;
+}
+
+function joinBlocks(blocks, total) {
+  const all = new Float32Array(total);
+  let at = 0;
+  for (const b of blocks) { all.set(b, at); at += b.length; }
+  return all;
+}
+
+/** Transcribe the cut + levelled audio. Returns [{start, end, text}, ...]. */
+async function transcribeCut(keep, rate, channels, levelKey, quality, onProgress, onNote) {
+  const asr = await loadTranscriber(quality, onNote);
+
+  // where each keep-range ends, measured in the finished video's timeline
+  const bounds = [];
+  let acc = 0;
+  for (const r of keep) { acc += r[1] - r[0]; bounds.push(acc); }
+  const totalOut = acc;
+
+  const resampler = new window.CutdownAudio.Resampler(rate, WHISPER_RATE);
+  const cues = [];
+  let pending = [], pendingLen = 0, blockStart = 0;
+  let outSamples = 0, boundary = 0;
+
+  const flush = async () => {
+    if (!pendingLen) return;
+    const audio = joinBlocks(pending, pendingLen);
+    pending = []; pendingLen = 0;
+    const r = await asr(audio, { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 });
+    for (const c of (r.chunks || [])) {
+      const t = c.timestamp || [];
+      if (t[0] == null) continue;
+      const start = blockStart + t[0];
+      // a trailing chunk can come back with no end; give it the block's
+      const end = blockStart + (t[1] == null ? audio.length / WHISPER_RATE : t[1]);
+      const text = (c.text || '').trim();
+      if (text) cues.push({ start: start, end: Math.max(end, start + 0.2), text: text });
+    }
+    blockStart += audio.length / WHISPER_RATE;
+  };
+
+  await runAudioChain(keep, rate, channels, levelKey, { limit: window.CutdownAudio.LIMIT },
+    blocks => {
+      for (const b of blocks) {
+        const n = b[0].length;
+        if (!n) continue;
+        // whisper is mono; the left channel is what it gets
+        const got = resampler.push(b[0], n);
+        if (got.length) { pending.push(got); pendingLen += got.length; }
+        outSamples += n;
+      }
+    },
+    p => onProgress(p * 0.95),
+    async () => {
+      const outTime = outSamples / rate;
+      while (boundary < bounds.length && outTime >= bounds[boundary]) boundary++;
+      // only split where a cut already is, so no sentence is torn in half
+      if (pendingLen >= SUBTITLE_BLOCK_SECONDS * WHISPER_RATE &&
+          boundary > 0 && Math.abs(outTime - bounds[boundary - 1]) < 0.5) {
+        onNote(`Transcribing… ${fmtTime(blockStart)} of ${fmtTime(totalOut)}`);
+        await flush();
+      }
+    });
+
+  onNote('Transcribing the last of it…');
+  await flush();
+  onProgress(1);
+  return cues;
+}
+
+function srtTime(t, sep) {
+  const ms = Math.max(0, Math.round(t * 1000));
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor(ms / 60000) % 60;
+  const s = Math.floor(ms / 1000) % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:` +
+         `${String(s).padStart(2, '0')}${sep}${String(ms % 1000).padStart(3, '0')}`;
+}
+
+function toSrt(cues) {
+  return cues.map((c, i) =>
+    `${i + 1}\n${srtTime(c.start, ',')} --> ${srtTime(c.end, ',')}\n${c.text}\n`).join('\n');
+}
+
+function toVtt(cues) {
+  return 'WEBVTT\n\n' + cues.map(c =>
+    `${srtTime(c.start, '.')} --> ${srtTime(c.end, '.')}\n${c.text}\n`).join('\n');
 }
 
 async function processFast(onProgress, sink) {

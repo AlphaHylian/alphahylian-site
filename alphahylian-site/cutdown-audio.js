@@ -263,6 +263,43 @@
     return out;
   };
 
+  /* ------------------------------------------------------ resampling
+
+     Whisper wants 16 kHz mono. Low-pass below the new Nyquist first or every
+     frequency above 8 kHz folds back down as noise, which a speech model
+     hears as a much worse recording than it is.
+     ------------------------------------------------------------------- */
+
+  function Resampler(fromRate, toRate) {
+    this.step = fromRate / toRate;
+    this.pos = 0;                 // fractional read position in the input
+    this.prev = 0;                // last sample of the previous block
+    this.have = false;
+    // two cascaded low passes at 7 kHz: gentle enough not to dull speech,
+    // steep enough that what folds back is negligible
+    this.a = new Biquad(makeBiquad('lp', Math.min(7000, toRate * 0.44), fromRate, 0.707));
+    this.b = new Biquad(makeBiquad('lp', Math.min(7000, toRate * 0.44), fromRate, 0.707));
+    this.out = [];
+  }
+
+  /** Returns the resampled samples for this block as a Float32Array. */
+  Resampler.prototype.push = function (mono, count) {
+    const res = [];
+    for (let i = 0; i < count; i++) {
+      const v = this.b.run(this.a.run(mono[i]));
+      // emit every output sample whose position falls in [i-1, i]
+      while (this.have && this.pos <= i) {
+        const frac = this.pos - (i - 1);
+        res.push(this.prev + (v - this.prev) * frac);
+        this.pos += this.step;
+      }
+      this.prev = v;
+      this.have = true;
+    }
+    this.pos -= count;            // rebase for the next block
+    return Float32Array.from(res);
+  };
+
   /* --------------------------------------------------- speech detection
 
      Loudness alone cannot tell talking from a door slamming, and the whole
@@ -499,6 +536,7 @@
 
   const api = { Leveller: Leveller, Limiter: Limiter, LoudnessMeter: LoudnessMeter,
                 SpeechFeatures: SpeechFeatures, speechScores: speechScores,
+                Resampler: Resampler,
                 PRESETS: PRESETS, LIMIT: LIMIT };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CutdownAudio = api;

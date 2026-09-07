@@ -262,6 +262,20 @@
         </div>
 
         <div class="cd-group">
+          <label>Subtitles</label>
+          <div class="cd-seg" id="cd-subs" role="group">
+            <button type="button" data-v="off" aria-pressed="true">Off</button>
+            <button type="button" data-v="fast">Fast</button>
+            <button type="button" data-v="good">Accurate</button>
+          </div>
+          <div class="cd-hint" id="cd-subshint">Transcribes on your machine and gives you an .srt
+            to upload. Downloads a speech model the first time &mdash; about 40&nbsp;MB for Fast,
+            80&nbsp;MB for Accurate &mdash; then gets through roughly three minutes of talking a
+            minute, quicker if your browser has WebGPU. Only the parts it kept are transcribed,
+            so the timings already match the finished video. Worth proofreading either way.</div>
+        </div>
+
+        <div class="cd-group">
           <label>Quality</label>
           <div class="cd-seg" id="cd-quality" role="group">
             <button type="button" data-v="draft">Draft</button>
@@ -303,6 +317,8 @@
       <video id="cd-out" controls preload="metadata" playsinline></video>
       <div class="cd-actions" style="margin-top:14px">
         <a class="cd-btn" id="cd-download" download>Download</a>
+        <a class="cd-btn ghost" id="cd-srt" download hidden>Subtitles (.srt)</a>
+        <a class="cd-btn ghost" id="cd-vtt" download hidden>.vtt</a>
         <span class="cd-privacy" id="cd-outinfo"></span>
       </div>
     </div>

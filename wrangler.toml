@@ -1,9 +1,11 @@
+# Cloudflare Workers Builds runs from the repo root, so this config lives here.
+# The site itself is in v2/ (v2/public = static files, v2/src = Worker).
 name = "alphahylian-site"
-main = "src/worker.js"
+main = "v2/src/worker.js"
 compatibility_date = "2026-01-01"
 
 [assets]
-directory = "./public"
+directory = "./v2/public"
 binding = "ASSETS"
 # Let the worker handle /api/* and short links; everything else is a static file.
 run_worker_first = ["/api/*", "/yt", "/youtube", "/tiktok", "/tt", "/ig", "/instagram", "/discord", "/dc"]

@@ -285,10 +285,30 @@ function renderDiscord(d) {
   if (d.icon) $("dc-icon").src = d.icon;
 }
 
+// Discord often refuses requests from Cloudflare's servers, so when the Worker
+// comes back without counts, ask Discord straight from the visitor's browser.
+function discordFromBrowser() {
+  return fetch("https://discord.com/api/v9/invites/QFWWQhbz7P?with_counts=true")
+    .then((r) => r.json())
+    .then((d) => {
+      const g = d.guild || {};
+      renderDiscord({
+        members: d.approximate_member_count,
+        online: d.approximate_presence_count,
+        icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=128` : null,
+      });
+    })
+    .catch(() => {});
+}
+
 fetch("/api/stats")
   .then((r) => r.json())
-  .then((d) => { renderSubs(d.subscribers); renderDiscord(d.discord); })
-  .catch(() => {});
+  .then((d) => {
+    renderSubs(d.subscribers);
+    if (d.discord) renderDiscord(d.discord);
+    else discordFromBrowser();
+  })
+  .catch(() => discordFromBrowser());
 
 /* ---------- friend bios ---------- */
 (() => {

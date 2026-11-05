@@ -1,0 +1,10 @@
+name = "alphahylian-site"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# Let the worker handle /api/* and short links; everything else is a static file.
+run_worker_first = ["/api/*", "/yt", "/youtube", "/tiktok", "/tt", "/ig", "/instagram", "/discord", "/dc"]
+not_found_handling = "404-page"
